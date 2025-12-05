@@ -197,11 +197,13 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 ## 📁 Supported File Formats
 
 | Format | Extension | Example |
-|--------|-----------|---------|
+|--------|-----------|-------|
 | **JSON** | `.json` | `{"speed": 1.5, "debug": true}` |
-| **YAML** | `.yaml`, `.yml` | `speed: 1.5` (simple key-value only) |
+| **YAML** ⚠️ | `.yaml`, `.yml` | `speed: 1.5` |
 | **INI** | `.ini`, `.cfg` | `speed = 1.5` |
 | **Plain Text** | `.txt` | `1.5` |
+
+> ⚠️ **YAML Limitation**: Only simple `key: value` pairs are supported. **No nested objects, arrays, or advanced YAML features.** See details below.
 
 <details>
 <summary>📄 Format Examples (click to expand)</summary>
@@ -215,9 +217,14 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 }
 ```
 
-### YAML (Simple Key-Value Only)
+### ⚠️ YAML (Simple Key-Value Only)
 
-> ⚠️ **Limitation**: CppLiveTuner supports **only simple `key: value` format**. This is a lightweight parser designed for parameter tuning, not a full YAML parser.
+> [!WARNING]
+> **CppLiveTuner is NOT a full YAML parser!**
+> 
+> Only simple `key: value` pairs are supported. Nested objects, arrays, multi-line strings, and other advanced YAML features will **silently fail or produce unexpected results**.
+> 
+> **For complex configurations, use JSON instead.**
 
 **✅ Supported:**
 ```yaml

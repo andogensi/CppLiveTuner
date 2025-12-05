@@ -201,9 +201,11 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 | フォーマット | 拡張子 | 例 |
 |-------------|--------|-----|
 | **JSON** | `.json` | `{"speed": 1.5, "debug": true}` |
-| **YAML** | `.yaml`, `.yml` | `speed: 1.5` (シンプルなkey-value形式のみ) |
+| **YAML** ⚠️ | `.yaml`, `.yml` | `speed: 1.5` |
 | **INI** | `.ini`, `.cfg` | `speed = 1.5` |
 | **プレーンテキスト** | `.txt` | `1.5` |
+
+> ⚠️ **YAML制限事項**: シンプルな `key: value` 形式のみ対応。**ネストされたオブジェクト、配列、高度なYAML機能は非対応。** 詳細は下記参照。
 
 <details>
 <summary>📄 フォーマット例 (クリックで展開)</summary>
@@ -217,9 +219,14 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 }
 ```
 
-### YAML (シンプルなKey-Value形式のみ)
+### ⚠️ YAML (シンプルなKey-Value形式のみ)
 
-> ⚠️ **制限事項**: CppLiveTunerは**シンプルな `key: value` 形式のみ**をサポートしています。これはパラメータチューニング用に設計された軽量パーサーであり、完全なYAMLパーサーではありません。
+> [!WARNING]
+> **CppLiveTunerは完全なYAMLパーサーではありません！**
+> 
+> シンプルな `key: value` 形式のみ対応しています。ネストされたオブジェクト、配列、複数行文字列、その他の高度なYAML機能は**エラーなく無視されるか、予期しない結果を生成します**。
+> 
+> **複雑な設定にはJSONを使用してください。**
 
 **✅ サポートあり:**
 ```yaml

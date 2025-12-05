@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [g++, clang++]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build with ${{ matrix.compiler }}
+      run: |
+        ${{ matrix.compiler }} --version
+        ${{ matrix.compiler }} -std=c++17 -Wall -Wextra -Werror -I. test_compile.cpp -o test_compile -pthread
+    
+    - name: Run tests
+      run: ./test_compile
+
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup MSVC
+      uses: microsoft/setup-msbuild@v2
+    
+    - name: Build with MSVC
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        cl /std:c++17 /W4 /WX /EHsc /I. test_compile.cpp /Fe:test_compile.exe
+    
+    - name: Run tests
+      run: .\test_compile.exe
+
+  build-macos:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build with clang++
+      run: |
+        clang++ --version
+        clang++ -std=c++17 -Wall -Wextra -Werror -I. test_compile.cpp -o test_compile -framework CoreServices
+    
+    - name: Run tests
+      run: ./test_compile
+
+  cmake-build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Configure CMake
+      run: cmake -B build -DLIVETUNER_BUILD_EXAMPLES=ON -DLIVETUNER_BUILD_TESTS=ON
+    
+    - name: Build
+      run: cmake --build build
+    
+    - name: Run CTest
+      run: ctest --test-dir build --output-on-failure

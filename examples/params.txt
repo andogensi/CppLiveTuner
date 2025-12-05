@@ -1,0 +1,5 @@
+# LiveTuner sample parameter file
+# Edit this value while the program is running
+# and see it update in real-time!
+
+1.5

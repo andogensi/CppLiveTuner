@@ -1,0 +1,6 @@
+{
+    "speed": 1.5,
+    "gravity": 9.8,
+    "debug": false,
+    "player_name": "Hero"
+}

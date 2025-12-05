@@ -18,6 +18,12 @@
 
 ---
 
+> **📋 STB-style Single Header Library**  
+> Just `#define LIVETUNER_IMPLEMENTATION` in **one** `.cpp` file before including.  
+> All other files simply `#include "LiveTuner.h"` — no `Windows.h` pollution, no linker headaches!
+
+---
+
 ## ✨ Why CppLiveTuner?
 
 Tired of the **edit → compile → run → check → repeat** cycle just to tweak a single value?

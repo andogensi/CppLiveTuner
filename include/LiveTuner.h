@@ -1,4 +1,28 @@
 #pragma once
+/*
+================================================================================
+    LiveTuner.h - Live Parameter Tuning Library
+    
+    STB-STYLE SINGLE-HEADER LIBRARY
+================================================================================
+
+    ████████████████████████████████████████████████████████████████████████████
+    █                                                                          █
+    █   IMPORTANT: STB-Style Usage                                             █
+    █                                                                          █
+    █   In EXACTLY ONE source file (.cpp), do this:                            █
+    █                                                                          █
+    █       #define LIVETUNER_IMPLEMENTATION                                   █
+    █       #include "LiveTuner.h"                                             █
+    █                                                                          █
+    █   In all OTHER files, just include normally:                             █
+    █                                                                          █
+    █       #include "LiveTuner.h"                                             █
+    █                                                                          █
+    ████████████████████████████████████████████████████████████████████████████
+
+================================================================================
+*/
 
 /**
  * @file LiveTuner.h

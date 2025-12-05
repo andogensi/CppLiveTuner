@@ -60,6 +60,18 @@ Tired of the **edit → compile → run → check → repeat** cycle just to twe
 
 ---
 
+## 🎬 Demo
+
+<div align="center">
+
+![CppLiveTuner Demo](LIveTuner.gif)
+
+*Edit the config file → Changes appear instantly in the running program!*
+
+</div>
+
+---
+
 ## 📦 Installation
 
 **Just copy one file** — that's it!

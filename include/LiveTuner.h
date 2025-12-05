@@ -1603,7 +1603,8 @@ inline bool parse_value<std::string>(const std::string& str, std::string& value)
  * @brief JSON parser using picojson
  * 
  * picojson by Kazuho Oku and Cybozu Labs, Inc. (BSD 2-Clause License)
- * Extracts values from flat JSON objects
+ * Extracts values from JSON objects, including nested structures
+ * Nested keys are flattened using dot notation (e.g., "parent.child.value")
  */
 class PicojsonParser {
 public:
@@ -1620,24 +1621,103 @@ public:
         }
         
         const picojson::object& obj = v.get<picojson::object>();
+        flatten_object(obj, "", result);
         
+        return !result.empty();
+    }
+
+private:
+    /**
+     * @brief Convert double to string, outputting integers without decimal point
+     * 
+     * Examples:
+     *   97.0 -> "97"
+     *   3.14 -> "3.14"
+     *   100.500 -> "100.5"
+     */
+    static std::string double_to_string(double value) {
+        // Check if the value is an integer
+        if (std::floor(value) == value && std::abs(value) < 1e15) {
+            // Output as integer (without decimal point)
+            return std::to_string(static_cast<long long>(value));
+        }
+        
+        // For floating-point values, format properly
+        std::ostringstream oss;
+        oss << std::fixed << value;
+        std::string str = oss.str();
+        
+        // Remove trailing zeros after decimal point
+        size_t dot_pos = str.find('.');
+        if (dot_pos != std::string::npos) {
+            size_t last_non_zero = str.find_last_not_of('0');
+            if (last_non_zero != std::string::npos && last_non_zero > dot_pos) {
+                str = str.substr(0, last_non_zero + 1);
+            } else if (last_non_zero == dot_pos) {
+                // All zeros after decimal point, remove decimal point too
+                str = str.substr(0, dot_pos);
+            }
+        }
+        
+        return str;
+    }
+    
+    /**
+     * @brief Recursively flatten nested JSON objects into dot-notation keys
+     * 
+     * @param obj The picojson object to flatten
+     * @param prefix The current key prefix (empty for root level)
+     * @param result The output map to store flattened key-value pairs
+     */
+    static void flatten_object(const picojson::object& obj, const std::string& prefix, ValueMap& result) {
         for (const auto& kv : obj) {
-            const std::string& key = kv.first;
+            std::string key = prefix.empty() ? kv.first : prefix + "." + kv.first;
             const picojson::value& val = kv.second;
             
             if (val.is<std::string>()) {
                 result[key] = val.get<std::string>();
             } else if (val.is<double>()) {
-                result[key] = std::to_string(val.get<double>());
+                result[key] = double_to_string(val.get<double>());
             } else if (val.is<bool>()) {
                 result[key] = val.get<bool>() ? "true" : "false";
             } else if (val.is<picojson::null>()) {
                 result[key] = "";
+            } else if (val.is<picojson::object>()) {
+                // Recursively flatten nested objects
+                flatten_object(val.get<picojson::object>(), key, result);
+            } else if (val.is<picojson::array>()) {
+                // Flatten arrays with index notation (e.g., "key.0", "key.1")
+                flatten_array(val.get<picojson::array>(), key, result);
             }
-            // Skip nested objects and arrays
         }
-        
-        return !result.empty();
+    }
+    
+    /**
+     * @brief Recursively flatten JSON arrays into indexed dot-notation keys
+     * 
+     * @param arr The picojson array to flatten
+     * @param prefix The current key prefix
+     * @param result The output map to store flattened key-value pairs
+     */
+    static void flatten_array(const picojson::array& arr, const std::string& prefix, ValueMap& result) {
+        for (size_t i = 0; i < arr.size(); ++i) {
+            std::string key = prefix + "." + std::to_string(i);
+            const picojson::value& val = arr[i];
+            
+            if (val.is<std::string>()) {
+                result[key] = val.get<std::string>();
+            } else if (val.is<double>()) {
+                result[key] = double_to_string(val.get<double>());
+            } else if (val.is<bool>()) {
+                result[key] = val.get<bool>() ? "true" : "false";
+            } else if (val.is<picojson::null>()) {
+                result[key] = "";
+            } else if (val.is<picojson::object>()) {
+                flatten_object(val.get<picojson::object>(), key, result);
+            } else if (val.is<picojson::array>()) {
+                flatten_array(val.get<picojson::array>(), key, result);
+            }
+        }
     }
 };
 

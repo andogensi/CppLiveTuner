@@ -199,7 +199,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 | Format | Extension | Example |
 |--------|-----------|---------|
 | **JSON** | `.json` | `{"speed": 1.5, "debug": true}` |
-| **YAML** | `.yaml`, `.yml` | `speed: 1.5` |
+| **YAML** | `.yaml`, `.yml` | `speed: 1.5` (simple key-value only) |
 | **INI** | `.ini`, `.cfg` | `speed = 1.5` |
 | **Plain Text** | `.txt` | `1.5` |
 
@@ -215,12 +215,48 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 }
 ```
 
-### YAML
+### YAML (Simple Key-Value Only)
+
+> ⚠️ **Limitation**: CppLiveTuner supports **only simple `key: value` format**. This is a lightweight parser designed for parameter tuning, not a full YAML parser.
+
+**✅ Supported:**
 ```yaml
+# Comments are supported
 speed: 1.5
 gravity: 9.8
 debug: true
+name: "player1"
+---
+# Document markers are ignored
 ```
+
+**❌ NOT Supported:**
+```yaml
+# Nested structures
+player:
+  speed: 1.5      # ❌ Nested objects not supported
+  position:
+    x: 100        # ❌ Multi-level nesting not supported
+
+# Arrays/Lists
+items:            # ❌ Arrays not supported
+  - sword
+  - shield
+
+scores: [1, 2, 3] # ❌ Inline arrays not supported
+
+# Multi-line strings
+description: |    # ❌ Block scalars not supported
+  This is a
+  multi-line text
+
+# Anchors and aliases
+defaults: &defaults  # ❌ Anchors not supported
+  speed: 1.0
+```
+
+**💡 Need full YAML support?**  
+Use JSON format instead, or integrate a full YAML parser library (like yaml-cpp) and convert to JSON before passing to CppLiveTuner.
 
 ### INI / Key-Value
 ```ini

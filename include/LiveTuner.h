@@ -37,7 +37,7 @@
  * - Event-driven file watching using OS native APIs (Windows/Linux/macOS)
  * - Non-blocking API (suitable for game loops)
  * - Named parameters (simultaneous monitoring of multiple values)
- * - Support for JSON/YAML/INI formats
+ * - Support for JSON/YAML(simple key:value only)/INI formats
  * - STB-style header-only, C++17 or later
  * 
  * Example (single value):
@@ -1517,8 +1517,8 @@ enum class FileFormat {
     Auto,       ///< Auto-detect from extension
     Plain,      ///< Plain text (one value per line)
     KeyValue,   ///< key=value format (INI-style)
-    Json,       ///< JSON format
-    Yaml        ///< YAML format (simple support)
+    Json,       ///< JSON format (full support via picojson)
+    Yaml        ///< YAML format (simple key: value only, no nesting/arrays)
 };
 
 namespace internal {
@@ -1644,7 +1644,26 @@ public:
 /**
  * @brief Lightweight YAML/INI parser (no external dependencies)
  * 
- * Supports key: value or key=value format
+ * This is a SIMPLE key-value parser, NOT a full YAML parser.
+ * 
+ * Supported features:
+ * - key: value format (YAML-style)
+ * - key=value format (INI-style)
+ * - # and ; comments
+ * - Quoted string values ("value" or 'value')
+ * - Document markers (--- and ...) are ignored
+ * - Section headers ([section]) are ignored
+ * 
+ * NOT supported (YAML advanced features):
+ * - Nested structures (objects within objects)
+ * - Arrays/lists (both block and inline)
+ * - Multi-line strings (block scalars | and >)
+ * - Anchors and aliases (& and *)
+ * - Type tags (!!)
+ * - Multiple documents
+ * 
+ * For full YAML support, consider using yaml-cpp or converting
+ * your YAML to JSON format.
  */
 class SimpleKeyValueParser {
 public:

@@ -201,7 +201,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 | フォーマット | 拡張子 | 例 |
 |-------------|--------|-----|
 | **JSON** | `.json` | `{"speed": 1.5, "debug": true}` |
-| **YAML** | `.yaml`, `.yml` | `speed: 1.5` |
+| **YAML** | `.yaml`, `.yml` | `speed: 1.5` (シンプルなkey-value形式のみ) |
 | **INI** | `.ini`, `.cfg` | `speed = 1.5` |
 | **プレーンテキスト** | `.txt` | `1.5` |
 
@@ -217,12 +217,48 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 }
 ```
 
-### YAML
+### YAML (シンプルなKey-Value形式のみ)
+
+> ⚠️ **制限事項**: CppLiveTunerは**シンプルな `key: value` 形式のみ**をサポートしています。これはパラメータチューニング用に設計された軽量パーサーであり、完全なYAMLパーサーではありません。
+
+**✅ サポートあり:**
 ```yaml
+# コメントはサポート
 speed: 1.5
 gravity: 9.8
 debug: true
+name: "player1"
+---
+# ドキュメントマーカーは無視される
 ```
+
+**❌ サポートなし:**
+```yaml
+# ネストされた構造
+player:
+  speed: 1.5      # ❌ ネストされたオブジェクトは非対応
+  position:
+    x: 100        # ❌ 多階層ネストは非対応
+
+# 配列/リスト
+items:            # ❌ 配列は非対応
+  - sword
+  - shield
+
+scores: [1, 2, 3] # ❌ インライン配列は非対応
+
+# 複数行文字列
+description: |    # ❌ ブロックスカラーは非対応
+  This is a
+  multi-line text
+
+# アンカーとエイリアス
+defaults: &defaults  # ❌ アンカーは非対応
+  speed: 1.0
+```
+
+**💡 完全なYAMLサポートが必要な場合**  
+JSON形式を使用するか、完全なYAMLパーサーライブラリ（yaml-cppなど）を統合し、CppLiveTunerに渡す前にJSONに変換してください。
 
 ### INI / キーバリュー形式
 ```ini

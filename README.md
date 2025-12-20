@@ -24,7 +24,7 @@
 
 ---
 
-## ✨ Why CppLiveTuner?
+##  Why CppLiveTuner?
 
 Tired of the **edit → compile → run → check → repeat** cycle just to tweak a single value?
 
@@ -42,31 +42,31 @@ Tired of the **edit → compile → run → check → repeat** cycle just to twe
 
 | Use Case | Example |
 |----------|---------|
-| 🎮 **Game Development** | Tweak jump height, movement speed, spawn rates while playing |
-| 🎨 **Graphics/Shaders** | Adjust exposure, bloom, color grading in real-time |
-| 🤖 **Robotics/Simulation** | Tune PID parameters, sensor thresholds live |
-| 🔧 **Debug/Profiling** | Toggle debug displays, adjust log levels on the fly |
+| **Game Development** | Tweak jump height, movement speed, spawn rates while playing |
+| **Graphics/Shaders** | Adjust exposure, bloom, color grading in real-time |
+| **Robotics/Simulation** | Tune PID parameters, sensor thresholds live |
+| **Debug/Profiling** | Toggle debug displays, adjust log levels on the fly |
 
 ---
 
-## 🚀 Features
+## Features
 
 | Feature | Description |
 |---------|-------------|
-| ⚡ **Zero Recompilation** | Change parameters while the program is running |
-| 🔌 **Header-only** | Single file, no dependencies. Just `#include` and go |
-| 🛡️ **STB-style** | No `Windows.h` pollution in your project |
-| 🎯 **Non-blocking API** | Perfect for game loops and real-time apps |
-| 📝 **Multiple Formats** | JSON, YAML, INI, plain text |
-| 👁️ **Event-driven Watching** | Native OS APIs (inotify/FSEvents/ReadDirectoryChanges) |
-| 🧵 **Thread-safe** | Full mutex protection |
-| 🌐 **Cross-platform** | Windows, Linux, macOS |
-| 🧪 **Testable Design** | DI support, mock interfaces, test fixtures |
-| 📚 **nlohmann/json Support** | Optional adapter for nlohmann/json users |
+| **Zero Recompilation** | Change parameters while the program is running |
+| **Header-only** | Single file, no dependencies. Just `#include` and go |
+| **STB-style** | No `Windows.h` pollution in your project |
+| **Non-blocking API** | Perfect for game loops and real-time apps |
+| **Multiple Formats** | JSON, YAML, INI, plain text |
+| **Event-driven Watching** | Native OS APIs (inotify/FSEvents/ReadDirectoryChanges) |
+| **Thread-safe** | Full mutex protection |
+| **Cross-platform** | Windows, Linux, macOS |
+| **Testable Design** | DI support, mock interfaces, test fixtures |
+| **nlohmann/json Support** | Optional adapter for nlohmann/json users |
 
 ---
 
-## 🎬 Demo
+##  Demo
 
 <div align="center">
 
@@ -78,7 +78,7 @@ Tired of the **edit → compile → run → check → repeat** cycle just to twe
 
 ---
 
-## 📦 Installation
+##  Installation
 
 **Just copy one file** — that's it!
 
@@ -92,9 +92,9 @@ git submodule add https://github.com/andogensi/CppLiveTuner.git vendor/CppLiveTu
 
 ---
 
-## 🏁 Quick Start
+##  Quick Start
 
-### 1️⃣ Setup (STB-style Header-only)
+### 1 Setup (STB-style Header-only)
 
 ```cpp
 // In main.cpp (or ONE dedicated file)
@@ -107,7 +107,7 @@ git submodule add https://github.com/andogensi/CppLiveTuner.git vendor/CppLiveTu
 #include "LiveTuner.h"
 ```
 
-### 2️⃣ Simple Usage — Single Value
+### 2️ Simple Usage — Single Value
 
 ```cpp
 #define LIVETUNER_IMPLEMENTATION
@@ -129,7 +129,7 @@ int main() {
 ```
 → `speed` instantly becomes `2.5`! 🎉
 
-### 3️⃣ Recommended Usage — Named Parameters
+### 3️ Recommended Usage — Named Parameters
 
 ```cpp
 #define LIVETUNER_IMPLEMENTATION
@@ -184,7 +184,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 
 ---
 
-## 📖 API Reference
+##  API Reference
 
 ### Simple API — Single Value Tuning
 
@@ -212,7 +212,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 
 ---
 
-## 📁 Supported File Formats
+## Supported File Formats
 
 | Format | Extension | Example |
 |--------|-----------|-------|
@@ -244,7 +244,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 > 
 > **For complex configurations, use JSON instead.**
 
-**✅ Supported:**
+** Supported:**
 ```yaml
 # Comments are supported
 speed: 1.5
@@ -280,7 +280,7 @@ defaults: &defaults  # ❌ Anchors not supported
   speed: 1.0
 ```
 
-**💡 Need full YAML support?**  
+** Need full YAML support?**  
 Use JSON format instead, or integrate a full YAML parser library (like yaml-cpp) and convert to JSON before passing to CppLiveTuner.
 
 ### INI / Key-Value
@@ -298,7 +298,7 @@ debug = true
 
 ---
 
-## ⚡ Event-Driven File Watching
+## Event-Driven File Watching
 
 CppLiveTuner uses **native OS APIs** for maximum efficiency:
 
@@ -310,7 +310,7 @@ CppLiveTuner uses **native OS APIs** for maximum efficiency:
 
 ### Polling vs Event-Driven
 
-| | Polling 🐢 | Event-Driven ⚡ |
+| | Polling  | Event-Driven  |
 |---|---|---|
 | **CPU Usage** | High (constant) | Near zero |
 | **Latency** | 50-100ms | Real-time |
@@ -318,7 +318,7 @@ CppLiveTuner uses **native OS APIs** for maximum efficiency:
 
 ---
 
-## 🎮 Real-World Use Cases
+## Real-World Use Cases
 
 ### Game Development
 ```cpp
@@ -359,7 +359,7 @@ params.on_change([]() {
 
 ---
 
-## 🧪 Testable Design
+##  Testable Design
 
 CppLiveTuner supports **dependency injection** for enterprise-grade testability.
 
@@ -449,12 +449,12 @@ livetuner::set_log_callback([](LogLevel lvl, const std::string& msg) {
 
 ---
 
-## 📂 Project Structure
+##  Project Structure
 
 ```
 CppLiveTuner/
 ├── include/
-│   └── LiveTuner.h          # 🎯 Main header (just include this!)
+│   └── LiveTuner.h          #  Main header (just include this!)
 ├── examples/
 │   └── example.cpp          # Usage examples
 ├── Test/                    # Comprehensive test suite
@@ -464,7 +464,7 @@ CppLiveTuner/
 
 ---
 
-## ❓ Troubleshooting
+##  Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
@@ -477,13 +477,13 @@ CppLiveTuner/
 ## 🤝 Contributing
 
 Contributions welcome! Feel free to:
-- 🐛 Report bugs
-- 💡 Suggest features  
-- 🔧 Submit pull requests
+- Report bugs
+- Suggest features  
+- Submit pull requests
 
 ---
 
-## 📜 License
+## License
 
 **MIT License** — Free for personal and commercial use.
 
@@ -499,6 +499,6 @@ See [LICENSE](LICENSE) for full details.
 
 **[⭐ Star this repo](https://github.com/andogensi/CppLiveTuner)** if you find it useful!
 
-Made with ❤️ for the C++ community
+Made with for the C++ community
 
 </div>

@@ -1,91 +1,47 @@
 #pragma once
 /*
 ================================================================================
-    LiveTuner.h - Live Parameter Tuning Library
-    
-    STB-STYLE SINGLE-HEADER LIBRARY
+    LiveTuner.h - Live Parameter Tuning Library (STB-Style Single-Header)
 ================================================================================
 
-    ████████████████████████████████████████████████████████████████████████████
-    █                                                                          █
-    █   IMPORTANT: STB-Style Usage                                             █
-    █                                                                          █
-    █   In EXACTLY ONE source file (.cpp), do this:                            █
-    █                                                                          █
-    █       #define LIVETUNER_IMPLEMENTATION                                   █
-    █       #include "LiveTuner.h"                                             █
-    █                                                                          █
-    █   In all OTHER files, just include normally:                             █
-    █                                                                          █
-    █       #include "LiveTuner.h"                                             █
-    █                                                                          █
-    ████████████████████████████████████████████████████████████████████████████
+    USAGE:
+      In ONE .cpp file:    #define LIVETUNER_IMPLEMENTATION
+                            #include "LiveTuner.h"
+      
+      In other files:       #include "LiveTuner.h"
 
 ================================================================================
 */
 
 /**
  * @file LiveTuner.h
- * @brief Live Parameter Tuning Library (STB-style single-header)
  * 
- * This is an STB-style header-only library. To use:
+ * Live Parameter Tuning Library (STB-style single-header)
  * 
- * 1. In ONE source file, define LIVETUNER_IMPLEMENTATION before including:
- *    @code
- *    #define LIVETUNER_IMPLEMENTATION
- *    #include "LiveTuner.h"
- *    @endcode
- * 
- * 2. In all other files, just include normally:
- *    @code
- *    #include "LiveTuner.h"
- *    @endcode
- * 
- * This design avoids polluting your project with Windows.h and other
- * platform-specific headers in most translation units.
- * 
- * This library includes picojson by Kazuho Oku and Cybozu Labs, Inc.
- * picojson is licensed under the 2-clause BSD License.
- * See the picojson license section at the end of this file.
- * 
- * To use an external picojson instead of the embedded version,
- * define LIVETUNER_USE_EXTERNAL_PICOJSON before including this header:
- *   #define LIVETUNER_USE_EXTERNAL_PICOJSON
- *   #include "picojson.h"
- *   #include "LiveTuner.h"
- * 
- * Allows injecting values into a running program by simply modifying
- * a text file without recompilation.
+ * Inject values into running programs by modifying text files.
  * 
  * Features:
- * - Event-driven file watching using OS native APIs (Windows/Linux/macOS)
- * - Non-blocking API (suitable for game loops)
- * - Named parameters (simultaneous monitoring of multiple values)
- * - Support for JSON/YAML(simple key:value only)/INI formats
- * - STB-style header-only, C++17 or later
+ * - Event-driven file watching (Windows/Linux/macOS)
+ * - Non-blocking API for game loops
+ * - JSON/YAML/INI support
+ * - C++17, header-only
  * 
- * Example (single value):
+ * Includes picojson (BSD 2-Clause License) by K. Oku & Cybozu Labs.
+ * For external picojson: #define LIVETUNER_USE_EXTERNAL_PICOJSON
+ * 
  * @code
+ * // Simple usage
  * float speed = 1.0f;
  * while (running) {
- *     tune_try(speed);  // Monitor params.txt for changes and update value
+ *     tune_try(speed);
  *     player.move(speed);
  * }
- * @endcode
  * 
- * Example (named parameters):
- * @code
+ * // Named parameters
  * livetuner::Params params("config.json");
- * float speed = 1.0f, gravity = 9.8f;
- * bool debug = false;
- * 
- * params.bind("speed", speed, 1.0f);      // With default value
- * params.bind("gravity", gravity, 9.8f);
- * params.bind("debug", debug, false);
- * 
+ * params.bind("speed", speed, 1.0f);
  * while (running) {
- *     params.update();  // Update all if changed
- *     // speed, gravity, debug are now at latest values
+ *     params.update();
  * }
  * @endcode
  */
@@ -123,19 +79,8 @@
  * @def LIVETUNER_ENABLE_DEFAULT_LOGGING
  * @brief Enable/disable default logging to stderr
  * 
- * By default, LiveTuner outputs log messages to std::cerr if no custom
- * log callback is set. This is useful for development and debugging.
- * 
- * However, in GUI-only applications (especially on Windows) or in
- * production environments where console output is not desired,
- * you can disable this default logging by defining:
- * 
- *   #define LIVETUNER_ENABLE_DEFAULT_LOGGING 0
- * 
- * before including this header. When disabled, logs will only be output
- * through a custom log callback set via set_log_callback().
- * 
- * Default: 1 (enabled) for debug builds, 0 (disabled) for release builds
+ * Default: 1 for debug builds, 0 for release builds.
+ * Define as 0 before including to disable default logging.
  */
 #ifndef LIVETUNER_ENABLE_DEFAULT_LOGGING
   #if defined(_DEBUG) || defined(DEBUG) || !defined(NDEBUG)
@@ -148,13 +93,8 @@
 // ============================================================
 // Platform-specific headers
 // ============================================================
-// 
-// Note: Platform-specific headers (Windows.h, inotify, FSEvents) are
-// only included in the implementation section (LIVETUNER_IMPLEMENTATION).
-// This keeps your compilation clean from Windows.h pollution in most
-// translation units.
-//
-// The FileWatcher class uses PIMPL idiom to hide platform details.
+// Platform headers are only included in LIVETUNER_IMPLEMENTATION section.
+// FileWatcher uses PIMPL idiom to hide platform details.
 
 namespace livetuner {
 
@@ -288,38 +228,14 @@ inline LogCallback& get_global_log_callback() {
 /**
  * @brief Set global log callback
  * 
- * By default, LiveTuner uses an internal log handler that outputs to std::cerr
- * (only in debug builds unless LIVETUNER_ENABLE_DEFAULT_LOGGING is explicitly set).
+ * By default, outputs to std::cerr in debug builds.
+ * Set custom callback or nullptr to disable.
  * 
- * You can replace this with your own logging system:
- * 
- * Example (custom logger):
  * @code
  * livetuner::set_log_callback([](livetuner::LogLevel level, const std::string& msg) {
- *     MyLogger::log(level, msg);  // Use your own logging system
+ *     MyLogger::log(level, msg);
  * });
  * @endcode
- * 
- * Example (disable all logging):
- * @code
- * livetuner::set_log_callback(nullptr);
- * @endcode
- * 
- * Example (standard cerr output):
- * @code
- * livetuner::set_log_callback([](livetuner::LogLevel level, const std::string& msg) {
- *     const char* level_str = "INFO";
- *     switch (level) {
- *         case livetuner::LogLevel::Debug: level_str = "DEBUG"; break;
- *         case livetuner::LogLevel::Info: level_str = "INFO"; break;
- *         case livetuner::LogLevel::Warning: level_str = "WARN"; break;
- *         case livetuner::LogLevel::Error: level_str = "ERROR"; break;
- *     }
- *     std::cerr << "[LiveTuner:" << level_str << "] " << msg << std::endl;
- * });
- * @endcode
- * 
- * @param callback The log callback function. Pass nullptr to disable logging.
  */
 inline void set_log_callback(LogCallback callback) {
     get_global_log_callback() = std::move(callback);
@@ -328,40 +244,10 @@ inline void set_log_callback(LogCallback callback) {
 // ============================================================
 // Vendored: picojson
 // ============================================================
-// picojson - a C++ JSON parser / serializer
-// Copyright 2009-2010 Cybozu Labs, Inc.
-// Copyright 2011-2014 Kazuho Oku
-// All rights reserved.
+// picojson - Copyright 2009-2010 Cybozu Labs, 2011-2014 Kazuho Oku
+// 2-clause BSD License (see LICENSE section at end of file)
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-//    this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-//    this list of conditions and the following disclaimer in the documentation
-//    and/or other materials provided with the distribution.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
-// ============================================================
-//
-// Note: If you want to use an external picojson instead of the embedded version,
-// define LIVETUNER_USE_EXTERNAL_PICOJSON before including this header.
-// Example:
-//   #define LIVETUNER_USE_EXTERNAL_PICOJSON
-//   #include "picojson.h"  // Your external picojson
-//   #include "LiveTuner.h"
+// To use external picojson: #define LIVETUNER_USE_EXTERNAL_PICOJSON
 
 #ifndef LIVETUNER_USE_EXTERNAL_PICOJSON
 
@@ -1433,25 +1319,10 @@ struct FileWatcherConfig {
 };
 
 /**
- * @brief Cross-platform file watcher class (PIMPL pattern)
+ * @brief Cross-platform file watcher (PIMPL pattern)
  * 
- * Detects file changes event-driven using OS native APIs.
- * - Windows: ReadDirectoryChangesW
- * - Linux: inotify
- * - macOS: FSEvents
- * 
- * The implementation uses PIMPL (Pointer to Implementation) pattern to:
- * - Hide platform-specific headers (Windows.h, etc.) from user code
- * - Keep compilation clean in most translation units
- * 
- * Protection against many file changes on Windows:
- * - Expanded default buffer size to 64KB (previously 4KB)
- * - Automatic buffer expansion on overflow
- * - Overflow detection and callback notification
- * 
- * @note Requires LIVETUNER_IMPLEMENTATION to be defined in exactly ONE
- *       source file for full functionality. Without it, only polling mode
- *       is available.
+ * Uses OS native APIs: Windows (ReadDirectoryChangesW), Linux (inotify), macOS (FSEvents).
+ * Requires LIVETUNER_IMPLEMENTATION in one source file. Falls back to polling without it.
  */
 class FileWatcher {
 public:
@@ -1748,26 +1619,10 @@ private:
 /**
  * @brief Lightweight YAML/INI parser (no external dependencies)
  * 
- * This is a SIMPLE key-value parser, NOT a full YAML parser.
- * 
- * Supported features:
- * - key: value format (YAML-style)
- * - key=value format (INI-style)
- * - # and ; comments
- * - Quoted string values ("value" or 'value')
- * - Document markers (--- and ...) are ignored
- * - Section headers ([section]) are ignored
- * 
- * NOT supported (YAML advanced features):
- * - Nested structures (objects within objects)
- * - Arrays/lists (both block and inline)
- * - Multi-line strings (block scalars | and >)
- * - Anchors and aliases (& and *)
- * - Type tags (!!)
- * - Multiple documents
- * 
- * For full YAML support, consider using yaml-cpp or converting
- * your YAML to JSON format.
+ * Simple key-value parser, NOT a full YAML parser.
+ * Supports: key:value, key=value, comments (#;), quoted values.
+ * NOT supported: nested structures, arrays, multi-line strings, anchors, tags.
+ * For full YAML support, use yaml-cpp or convert to JSON.
  */
 class SimpleKeyValueParser {
 public:
@@ -1833,43 +1688,18 @@ public:
 // ============================================================
 
 /**
- * @brief File watcher configuration (public alias)
+ * @brief File watcher configuration
  * 
- * Allows configuration of Windows ReadDirectoryChangesW buffer size, etc.
- * 
- * Example:
- * @code
- * livetuner::FileWatcherConfig config;
- * config.buffer_size = 262144;  // 256KB
- * config.auto_grow_buffer = true;
- * config.on_buffer_overflow = [](size_t old_size, size_t new_size) {
- *     std::cerr << "Buffer overflow detected!" << std::endl;
- * };
- * 
- * livetuner::Params params("config.json");
- * params.set_watcher_config(config);
- * params.start_watching();
- * @endcode
+ * Configure buffer size and overflow handling for file watching.
+ * @see Params::set_watcher_config()
  */
 using FileWatcherConfig = internal::FileWatcherConfig;
 
 /**
- * @brief File read retry configuration (public alias)
+ * @brief File read retry configuration
  * 
- * Reading a file while an editor is writing can result in reading
- * incomplete data and causing parse errors (especially on Windows).
- * This configuration allows customization of retry behavior.
- * 
- * Example:
- * @code
- * livetuner::FileReadRetryConfig config;
- * config.max_retries = 5;          // Retry up to 5 times
- * config.retry_delay = std::chrono::milliseconds(10);  // Initial 10ms wait
- * config.backoff_multiplier = 2.0; // Double wait time each retry
- * 
- * livetuner::Params params("config.json");
- * params.set_read_retry_config(config);
- * @endcode
+ * Prevents read errors while editor is writing (especially on Windows).
+ * @see Params::set_read_retry_config()
  */
 using FileReadRetryConfig = internal::FileReadRetryConfig;
 
@@ -1878,48 +1708,12 @@ using FileReadRetryConfig = internal::FileReadRetryConfig;
 // ============================================================
 
 /**
- * @brief Class for managing named parameters
+ * @brief Named parameter management
  * 
- * Binds multiple variables to a file and updates them in batch.
+ * Binds multiple variables to a file and updates in batch.
  * 
- * @note Thread Safety - Callback Execution:
- * Callbacks registered via on_change() are executed on the SAME THREAD
- * that calls update(). This is typically the main thread, making it safe
- * to call rendering APIs (OpenGL/DirectX) or other main-thread-only operations
- * from within the callback.
- * 
- * This differs from LiveTuner's event-driven mode, where callbacks may be
- * invoked from a background file-watching thread.
- * 
- * Example:
- * @code
- * // config.json:
- * // {
- * //   "speed": 1.5,
- * //   "gravity": 9.8,
- * //   "debug": true
- * // }
- * 
- * livetuner::Params params("config.json");
- * float speed, gravity;
- * bool debug;
- * 
- * params.bind("speed", speed, 1.0f);
- * params.bind("gravity", gravity, 9.8f);
- * params.bind("debug", debug, false);
- * 
- * // Callbacks run on the thread that calls update() (typically main thread),
- * // so it's safe to call rendering APIs like OpenGL/DirectX
- * params.on_change([]() {
- *     std::cout << "Config updated!\n";
- *     // Safe to update rendering settings, etc.
- * });
- * 
- * while (running) {
- *     params.update();  // Called from main thread
- *     // speed, gravity, debug are automatically updated
- * }
- * @endcode
+ * @note Thread Safety: Callbacks run on the thread calling update() (main thread).
+ * Safe for OpenGL/DirectX. Differs from LiveTuner's background thread callbacks.
  */
 class Params {
 public:
@@ -2006,21 +1800,9 @@ public:
     }
     
     /**
-     * @brief Change file read retry configuration
+     * @brief Set file read retry configuration
      * 
-     * Used to avoid conflicts while editor is writing to file.
-     * Especially effective on Windows.
-     * 
-     * Example:
-     * @code
-     * livetuner::Params params("config.json");
-     * 
-     * // Customize retry settings
-     * auto config = params.get_read_retry_config();
-     * config.max_retries = 5;
-     * config.retry_delay = std::chrono::milliseconds(10);
-     * params.set_read_retry_config(config);
-     * @endcode
+     * Avoids conflicts while editor is writing (especially on Windows).
      */
     void set_read_retry_config(const internal::FileReadRetryConfig& config) {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -2043,24 +1825,9 @@ public:
     }
     
     /**
-     * @brief Change file watcher configuration
+     * @brief Set file watcher configuration
      * 
-     * If watching, changes take effect on next start_watching() call.
-     * 
-     * Example:
-     * @code
-     * livetuner::Params params("config.json");
-     * 
-     * // If many file changes are expected
-     * auto config = params.get_watcher_config();
-     * config.buffer_size = 262144;  // 256KB
-     * config.on_buffer_overflow = [](size_t old_size, size_t new_size) {
-     *     std::cerr << "Buffer overflow: " << old_size << " -> " << new_size << std::endl;
-     * };
-     * params.set_watcher_config(config);
-     * 
-     * params.start_watching();
-     * @endcode
+     * Changes take effect on next start_watching() call.
      */
     void set_watcher_config(const internal::FileWatcherConfig& config) {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -2070,10 +1837,6 @@ public:
 
     /**
      * @brief Bind variable to parameter
-     * 
-     * @param name Parameter name (key in file)
-     * @param variable Reference to variable to bind
-     * @param default_value Default value if not in file
      */
     template<typename T>
     void bind(const std::string& name, T& variable, T default_value = T{}) {
@@ -2233,31 +1996,8 @@ public:
     /**
      * @brief Set callback for changes
      * 
-     * @param callback Function to be called when parameters are updated
-     * 
-     * @note Thread Safety - Critical for Game Development:
-     * The callback is executed on the SAME THREAD that calls update(),
-     * typically your main thread. This makes it SAFE to:
-     * - Call OpenGL/DirectX rendering APIs
-     * - Update UI elements
-     * - Access main-thread-only resources
-     * 
-     * This is a key difference from LiveTuner's event-driven mode,
-     * where callbacks may run on a background file-watching thread.
-     * 
-     * Example (safe OpenGL/DirectX usage):
-     * @code
-     * params.on_change([&shader]() {
-     *     // Safe: update() is called from main thread
-     *     shader.reload();  // OpenGL calls are safe here
-     *     std::cout << "Shader reloaded" << std::endl;
-     * });
-     * 
-     * while (running) {
-     *     params.update();  // Callback runs here on main thread
-     *     render();         // OpenGL rendering
-     * }
-     * @endcode
+     * @note Thread Safety: Callback runs on the thread calling update() (main thread).
+     * Safe for OpenGL/DirectX/UI operations.
      */
     void on_change(std::function<void()> callback) {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -2266,19 +2006,6 @@ public:
 
     /**
      * @brief Get last error information
-     * 
-     * @return Error information (type == ErrorType::None if no error)
-     * 
-     * Example:
-     * @code
-     * livetuner::Params params("config.json");
-     * if (!params.update()) {
-     *     auto error = params.last_error();
-     *     if (error) {
-     *         std::cerr << "Error: " << error.to_string() << std::endl;
-     *     }
-     * }
-     * @endcode
      */
     ErrorInfo last_error() const {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -2530,25 +2257,10 @@ private:
 // ============================================================
 
 /**
- * @brief Live parameter tuning class (Low-level API)
+ * @brief Live parameter tuning (Low-level API)
  * 
- * Monitors file and reads values when changes occur.
- * 
- * @warning Thread Safety - Event-Driven Mode:
- * When using event-driven mode with get_async() callbacks, the callback
- * may be invoked from a BACKGROUND FILE-WATCHING THREAD, not your main thread.
- * 
- * This means you CANNOT safely:
- * - Call OpenGL/DirectX rendering APIs directly
- * - Update UI elements directly
- * - Access main-thread-only resources
- * 
- * For game development where main-thread execution is required,
- * consider using the Params class instead, which guarantees callbacks
- * run on the thread that calls update().
- * 
- * If you must use LiveTuner with rendering APIs, ensure proper
- * thread synchronization (e.g., command queues, mutexes).
+ * @warning Event-driven callbacks run on background thread.
+ * Not safe for OpenGL/DirectX. Use Params class for main-thread execution.
  */
 class LiveTuner {
 public:
@@ -2589,21 +2301,9 @@ public:
     }
     
     /**
-     * @brief Change file read retry configuration
+     * @brief Set file read retry configuration
      * 
-     * Used to avoid conflicts while editor is writing to file.
-     * Especially effective on Windows.
-     * 
-     * Example:
-     * @code
-     * livetuner::LiveTuner tuner("params.txt");
-     * 
-     * // Customize retry settings
-     * auto config = tuner.get_read_retry_config();
-     * config.max_retries = 5;
-     * config.retry_delay = std::chrono::milliseconds(10);
-     * tuner.set_read_retry_config(config);
-     * @endcode
+     * Avoids conflicts while editor is writing (especially on Windows).
      */
     void set_read_retry_config(const internal::FileReadRetryConfig& config) {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -2640,31 +2340,13 @@ public:
     }
     
     /**
-     * @brief Change file watcher configuration
-     * 
-     * Example:
-     * @code
-     * livetuner::LiveTuner tuner("params.txt");
-     * 
-     * // If many file changes are expected
-     * auto config = tuner.get_watcher_config();
-     * config.buffer_size = 262144;  // 256KB
-     * config.on_buffer_overflow = [](size_t old_size, size_t new_size) {
-     *     if (new_size == 0) {
-     *         std::cerr << "Buffer at maximum, events may be lost!" << std::endl;
-     *     } else {
-     *         std::cerr << "Buffer grown: " << old_size << " -> " << new_size << std::endl;
-     *     }
-     * };
-     * tuner.set_watcher_config(config);
-     * @endcode
+     * @brief Set file watcher configuration
      */
     void set_watcher_config(const internal::FileWatcherConfig& config) {
         std::lock_guard<std::mutex> lock(mtx_);
         file_watcher_config_ = config;
         file_watcher_config_.validate();
         
-        // Update configuration if watcher already exists
         if (file_watcher_) {
             file_watcher_->set_config(file_watcher_config_);
         }
@@ -2693,20 +2375,6 @@ public:
 
     /**
      * @brief Get last error information
-     * 
-     * @return Error information (type == ErrorType::None if no error)
-     * 
-     * Example:
-     * @code
-     * livetuner::LiveTuner tuner("params.txt");
-     * float speed = 1.0f;
-     * if (!tuner.try_get(speed)) {
-     *     auto error = tuner.last_error();
-     *     if (error) {
-     *         std::cerr << "Error: " << error.to_string() << std::endl;
-     *     }
-     * }
-     * @endcode
      */
     ErrorInfo last_error() const {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -2842,9 +2510,6 @@ public:
 
     /**
      * @brief Block until value is read
-     * 
-     * Waits until valid value is written to file.
-     * For debugging and experimental use.
      */
     template<typename T>
     void get(T& value) {
@@ -2867,10 +2532,6 @@ public:
 
     /**
      * @brief Read value with timeout
-     * 
-     * @param value Variable to store read value
-     * @param timeout Maximum wait time
-     * @return true if value was read within time limit
      */
     template<typename T>
     bool get_timeout(T& value, std::chrono::milliseconds timeout) {
@@ -3156,41 +2817,10 @@ private:
 // ============================================================
 
 /**
- * @brief Class for managing Tuner context with RAII
+ * @brief RAII context for LiveTuner
  * 
- * Use in large applications or unit tests when you want to avoid
- * global state. Automatically cleans up when leaving scope.
- * 
- * Example (test):
- * @code
- * TEST(MyTest, TestTuning) {
- *     livetuner::ScopedTunerContext ctx("test_params.txt");
- *     
- *     float value = 1.0f;
- *     ctx.tuner().try_get(value);
- *     // Automatic cleanup on test end
- * }
- * @endcode
- * 
- * Example (dependency injection):
- * @code
- * class GameEngine {
- *     livetuner::LiveTuner& tuner_;
- * public:
- *     explicit GameEngine(livetuner::LiveTuner& tuner) : tuner_(tuner) {}
- *     void update() {
- *         float speed;
- *         tuner_.try_get(speed);
- *     }
- * };
- * 
- * // Production
- * GameEngine engine(livetuner::get_default_tuner());
- * 
- * // Test
- * livetuner::LiveTuner test_tuner("test.txt");
- * GameEngine engine(test_tuner);
- * @endcode
+ * Avoids global state in tests and large applications.
+ * Automatically cleans up when leaving scope.
  */
 class ScopedTunerContext {
 public:
@@ -3212,19 +2842,7 @@ private:
 };
 
 /**
- * @brief Class for managing Params context with RAII
- * 
- * Example (test):
- * @code
- * TEST(MyTest, TestParams) {
- *     livetuner::ScopedParamsContext ctx("test_config.json");
- *     
- *     float speed = 1.0f;
- *     ctx.params().bind("speed", speed, 1.0f);
- *     ctx.params().update();
- *     // Automatic cleanup on test end
- * }
- * @endcode
+ * @brief RAII context for Params
  */
 class ScopedParamsContext {
 public:
@@ -3324,9 +2942,6 @@ private:
 
 /**
  * @brief Get default LiveTuner instance
- * 
- * @note For large applications or tests, recommend using ScopedTunerContext
- *       or LiveTuner class directly.
  */
 inline LiveTuner& get_default_tuner() {
     return internal::GlobalInstanceManager::instance().get_tuner();
@@ -3334,9 +2949,6 @@ inline LiveTuner& get_default_tuner() {
 
 /**
  * @brief Get default Params instance
- * 
- * @note For large applications or tests, recommend using ScopedParamsContext
- *       or Params class directly.
  */
 inline Params& get_default_params() {
     return internal::GlobalInstanceManager::instance().get_params();
@@ -3348,10 +2960,6 @@ inline Params& get_default_params() {
 
 /**
  * @brief Set file to monitor
- * @param file_path Parameter file path (default: "params.txt")
- * 
- * @note For large applications, recommend using LiveTuner class directly
- *       with dependency injection pattern.
  */
 inline void tune_init(std::string_view file_path) {
     get_default_tuner().set_file(file_path);
@@ -3359,18 +2967,6 @@ inline void tune_init(std::string_view file_path) {
 
 /**
  * @brief Try to read value immediately (non-blocking)
- * 
- * Example:
- * @code
- * float speed = 1.0f;
- * while (running) {
- *     tune_try(speed);  // Update if changed
- *     player.move(speed);
- * }
- * @endcode
- * 
- * @note For large applications, recommend using LiveTuner::try_get() directly
- *       with dependency injection pattern.
  */
 template<typename T>
 inline bool tune_try(T& value) {
@@ -3451,9 +3047,6 @@ inline void reset_global_tuner() {
 
 /**
  * @brief Set file for global Params
- * 
- * @note For large applications, recommend using the Params class directly
- *       with dependency injection pattern.
  */
 inline void params_init(std::string_view file_path, FileFormat format = FileFormat::Auto) {
     get_default_params().set_file(file_path, format);
@@ -3461,9 +3054,6 @@ inline void params_init(std::string_view file_path, FileFormat format = FileForm
 
 /**
  * @brief Bind variable to global Params
- * 
- * @note For large applications, recommend using Params::bind() directly
- *       with dependency injection pattern.
  */
 template<typename T>
 inline void params_bind(const std::string& name, T& variable, T default_value = T{}) {
@@ -3525,11 +3115,6 @@ inline void params_reset() {
 #ifdef LIVETUNER_ENABLE_TEST_SUPPORT
 /**
  * @brief Completely reset global Params
- * 
- * More powerful reset than params_reset(), recreates instance itself.
- * Use when complete separation between tests is needed.
- * 
- * @note Requires LIVETUNER_ENABLE_TEST_SUPPORT to be defined.
  */
 inline void reset_global_params() {
     internal::GlobalInstanceManager::instance().reset_params();
@@ -3537,8 +3122,6 @@ inline void reset_global_params() {
 
 /**
  * @brief Reset all global instances
- * 
- * @note Requires LIVETUNER_ENABLE_TEST_SUPPORT to be defined.
  */
 inline void reset_all_globals() {
     internal::GlobalInstanceManager::instance().reset_all();
@@ -3551,29 +3134,16 @@ inline void reset_all_globals() {
 
 #ifdef LIVETUNER_USE_NLOHMANN_JSON
 
-// nlohmann/json include
-// Users must #include <nlohmann/json.hpp> beforehand
 #ifndef NLOHMANN_JSON_VERSION_MAJOR
 #error "LIVETUNER_USE_NLOHMANN_JSON is defined but nlohmann/json.hpp is not included. Please #include <nlohmann/json.hpp> before LiveTuner.h"
 #endif
 
 /**
- * @brief Parameter management class for nlohmann/json
+ * @brief Parameter management for nlohmann/json
  * 
- * To use this class, the following steps are required:
- * 1. Add nlohmann/json to your project
- * 2. Define #define LIVETUNER_USE_NLOHMANN_JSON
- * 3. Include #include <nlohmann/json.hpp>
- * 4. Include #include "LiveTuner.h"
- * 
- * Features:
- * - Loading nested JSON objects
- * - Array support
- * - Type-safe value retrieval
- * - JSON schema validation
- * - Custom type serialization support
- * 
- * Example:
+ * Supports nested objects, arrays, and type-safe value retrieval.
+ * Requires: #include <nlohmann/json.hpp> before this header.
+ */
  * @code
  * #define LIVETUNER_USE_NLOHMANN_JSON
  * #include <nlohmann/json.hpp>
@@ -3959,29 +3529,6 @@ private:
 
 /**
  * @brief Automatic binding helper using nlohmann/json
- * 
- * Example:
- * @code
- * #define LIVETUNER_USE_NLOHMANN_JSON
- * #include <nlohmann/json.hpp>
- * #include "LiveTuner.h"
- * 
- * livetuner::NlohmannBinder binder("config.json");
- * 
- * float speed;
- * std::string name;
- * std::vector<float> position;
- * 
- * binder.bind("player.speed", speed, 1.0f);
- * binder.bind("player.name", name, std::string("Player"));
- * binder.bind("player.position", position, {0.0f, 0.0f, 0.0f});
- * 
- * while (running) {
- *     if (binder.update()) {
- *         // All bound variables are automatically updated
- *     }
- * }
- * @endcode
  */
 class NlohmannBinder {
 public:
@@ -4047,26 +3594,14 @@ private:
 } // namespace livetuner
 
 // ============================================================
-// Test Support (Optional - Include LiveTunerTest.h)
+// Test Support
 // ============================================================
 
 /**
- * If LIVETUNER_ENABLE_TEST_SUPPORT is defined, automatically include
- * LiveTunerTest.h which provides:
- * - TestFixture: RAII helper for resetting global state
- * - ITuner/IParams: Interfaces for dependency injection and mocking
- * - TunerAdapter/ParamsAdapter: Adapters for DI patterns
- * - ScopedContext: Thread-local context for isolated testing
- * - TunerFactory/ParamsFactory: Factory pattern for instance creation
- * - get_context_tuner()/get_context_params(): Context-aware access
+ * LIVETUNER_ENABLE_TEST_SUPPORT provides testing utilities:
+ * TestFixture, ITuner/IParams interfaces, adapters, factories.
  * 
- * For test code, define before including:
- *   #define LIVETUNER_ENABLE_TEST_SUPPORT
- *   #include "LiveTuner.h"
- * 
- * Or include LiveTunerTest.h directly:
- *   #include "LiveTuner.h"
- *   #include "LiveTunerTest.h"
+ * Usage: #define LIVETUNER_ENABLE_TEST_SUPPORT before including.
  */
 #ifdef LIVETUNER_ENABLE_TEST_SUPPORT
 #include "LiveTunerTest.h"
@@ -4077,14 +3612,8 @@ private:
  * LICENSE INFORMATION
  * ============================================================================
  * 
- * This library (LiveTuner) includes picojson, which is licensed under the
- * 2-clause BSD License (reproduced below).
- * 
- * ----------------------------------------------------------------------------
- * picojson - a C++ JSON parser / serializer
- * Copyright 2009-2010 Cybozu Labs, Inc.
- * Copyright 2011-2014 Kazuho Oku
- * All rights reserved.
+ * This library includes picojson (2-clause BSD License).
+ * Copyright 2009-2010 Cybozu Labs, Inc., 2011-2014 Kazuho Oku.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -4113,26 +3642,16 @@ private:
 // ============================================================================
 // IMPLEMENTATION SECTION
 // ============================================================================
-//
-// Define LIVETUNER_IMPLEMENTATION in exactly ONE source file before including
-// this header to provide the implementation of platform-specific features.
-//
-// Example:
-//   // In main.cpp or a dedicated livetuner.cpp:
-//   #define LIVETUNER_IMPLEMENTATION
-//   #include "LiveTuner.h"
-//
-// Without LIVETUNER_IMPLEMENTATION, FileWatcher will use polling mode only.
+// Define LIVETUNER_IMPLEMENTATION in ONE source file before including.
+// Without it, FileWatcher uses polling mode only.
 // ============================================================================
 
 #ifdef LIVETUNER_IMPLEMENTATION
 
 // ============================================================
-// MSVC warning suppression for implementation block
+// MSVC warning suppression
 // ============================================================
-// Suppress all warnings in the implementation section to avoid
-// noise from Windows.h and other platform headers when using
-// high warning levels (/W4 or /Wall)
+// Suppress warnings from platform headers (Windows.h, etc.)
 #if defined(_MSC_VER)
 #pragma warning(push, 0)
 #endif

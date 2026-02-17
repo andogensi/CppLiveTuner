@@ -647,7 +647,6 @@ private:
 };
 
 /**
- * @brief Factory for creating configured Params instances
  * 
  * Similar to TunerFactory, but for Params instances.
  * 
@@ -668,16 +667,10 @@ class ParamsFactory {
 public:
     using Configurator = std::function<void(Params&)>;
     
-    /**
-     * @brief Set default configuration applied to all created instances
-     */
     static void set_default_config(Configurator config) {
         get_config() = std::move(config);
     }
-    
-    /**
-     * @brief Create a new Params instance with default configuration
-     */
+
     static std::unique_ptr<Params> create(std::string_view file_path = "config.json",
                                            FileFormat format = FileFormat::Auto) {
         auto params = std::make_unique<Params>(file_path, format);
@@ -687,9 +680,6 @@ public:
         return params;
     }
     
-    /**
-     * @brief Create a new Params instance with custom configuration
-     */
     static std::unique_ptr<Params> create(std::string_view file_path,
                                            FileFormat format,
                                            Configurator custom_config) {

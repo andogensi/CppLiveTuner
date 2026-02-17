@@ -1794,7 +1794,7 @@ public:
     /**
      * @brief Get file read retry configuration
      */
-    const internal::FileReadRetryConfig& get_read_retry_config() const {
+    internal::FileReadRetryConfig get_read_retry_config() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return file_read_retry_config_;
     }
@@ -1819,7 +1819,7 @@ public:
     /**
      * @brief Get file watcher configuration
      */
-    const internal::FileWatcherConfig& get_watcher_config() const {
+    internal::FileWatcherConfig get_watcher_config() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return file_watcher_config_;
     }

@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🎚️ CppLiveTuner
+#  CppLiveTuner
 
 ### **Stop Recompiling. Start Tuning.**
 

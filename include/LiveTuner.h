@@ -3148,10 +3148,9 @@ inline void reset_all_globals() {
  * 
  * Supports nested objects, arrays, and type-safe value retrieval.
  * Requires: #include <nlohmann/json.hpp> before this header.
- */
+ * 
  * @code
  * #define LIVETUNER_USE_NLOHMANN_JSON
-
  * #include <nlohmann/json.hpp>
  * #include "LiveTuner.h"
  * 

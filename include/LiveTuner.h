@@ -70,7 +70,12 @@
 #include <cmath>
 #include <algorithm>
 #include <cctype>
-
+#include <cstdint>
+#include <cinttypes>
+#include <limits>
+#include <stdexcept>
+#include <cstdio>
+#include <cstdlib>
 // ============================================================
 // Configuration Macros
 // ============================================================
@@ -1936,7 +1941,7 @@ public:
     /**
      * @brief Start file watching (automatic update)
      * 
-     * Monitors file in background and automatically calls update() on changes.
+     * Monitors file in background and marks file as changed; call poll() from main loop on changes.
      */
     void start_watching() {
         // Skip processing during callback execution (prevent reentrancy)
@@ -3146,6 +3151,7 @@ inline void reset_all_globals() {
  */
  * @code
  * #define LIVETUNER_USE_NLOHMANN_JSON
+
  * #include <nlohmann/json.hpp>
  * #include "LiveTuner.h"
  * 

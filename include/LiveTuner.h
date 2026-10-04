@@ -76,9 +76,19 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <array>
+#include <iomanip>
+#include <type_traits>
 // ============================================================
 // Configuration Macros
 // ============================================================
+
+// Set consistently in every translation unit to disable runtime tuning in a
+// production build. Existing applications retain opt-in live tuning by default.
+#ifndef LIVETUNER_ENABLE_RUNTIME
+#define LIVETUNER_ENABLE_RUNTIME 1
+#endif
 
 /**
  * @def LIVETUNER_ENABLE_DEFAULT_LOGGING
@@ -120,7 +130,8 @@ enum class ErrorType {
     InvalidFormat,         ///< Invalid format
     Timeout,               ///< Timeout
     WatcherError,          ///< Failed to start file watcher
-    Unknown                ///< Unknown error
+    Unknown,               ///< Unknown error
+    Disabled               ///< Runtime tuning disabled by build policy
 };
 
 /**
@@ -163,6 +174,7 @@ struct ErrorInfo {
             case ErrorType::Timeout: return "Timeout";
             case ErrorType::WatcherError: return "WatcherError";
             case ErrorType::Unknown: return "Unknown";
+            case ErrorType::Disabled: return "Disabled";
             default: return "Unknown";
         }
     }
@@ -225,9 +237,17 @@ namespace internal {
 /**
  * @brief Global log callback (optional)
  */
-inline LogCallback& get_global_log_callback() {
-    static LogCallback callback = internal::default_log_handler;
-    return callback;
+namespace internal {
+    inline std::mutex& log_mutex() { static std::mutex mutex; return mutex; }
+    inline LogCallback& log_callback_storage() {
+        static LogCallback callback = default_log_handler;
+        return callback;
+    }
+}
+
+inline LogCallback get_global_log_callback() {
+    std::lock_guard<std::mutex> lock(internal::log_mutex());
+    return internal::log_callback_storage();
 }
 
 /**
@@ -243,7 +263,11 @@ inline LogCallback& get_global_log_callback() {
  * @endcode
  */
 inline void set_log_callback(LogCallback callback) {
-    get_global_log_callback() = std::move(callback);
+    // Destroy the previous callback after unlocking (its captures may reenter).
+    {
+        std::lock_guard<std::mutex> lock(internal::log_mutex());
+        internal::log_callback_storage().swap(callback);
+    }
 }
 
 // ============================================================
@@ -481,9 +505,18 @@ GET(std::string, *u_.string_)
 GET(array, *u_.array_)
 GET(object, *u_.object_)
 #ifdef PICOJSON_USE_INT64
-GET(double,
-    (type_ == int64_type && (const_cast<value *>(this)->type_ = number_type, (const_cast<value *>(this)->u_.number_ = u_.int64_)),
-     u_.number_))
+template <> inline const double& value::get<double>() const {
+  if (!is<double>()) throw std::runtime_error("type mismatch");
+  if (type_ == int64_type) {
+    auto* self = const_cast<value*>(this);
+    self->u_.number_ = static_cast<double>(u_.int64_);
+    self->type_ = number_type;
+  }
+  return u_.number_;
+}
+template <> inline double& value::get<double>() {
+  return const_cast<double&>(static_cast<const value&>(*this).get<double>());
+}
 GET(int64_t, u_.int64_)
 #else
 GET(double, u_.number_)
@@ -971,10 +1004,10 @@ template <typename Context, typename Iter> inline bool _parse(Context &ctx, inpu
         }
       }
 #endif
+      errno = 0;
       f = strtod(num_str.c_str(), &endp);
-      if (endp == num_str.c_str() + num_str.size()) {
-        ctx.set_number(f);
-        return true;
+      if (errno != ERANGE && std::isfinite(f) && endp == num_str.c_str() + num_str.size()) {
+        return ctx.set_number(f);
       }
       return false;
     }
@@ -1034,6 +1067,7 @@ public:
   bool parse_object_start() {
     if (depths_ == 0)
       return false;
+    --depths_;
     *out_ = value(object_type, false);
     return true;
   }
@@ -1077,7 +1111,9 @@ template <typename Iter> inline Iter parse(value &out, const Iter &first, const 
 
 inline std::string parse(value &out, const std::string &s) {
   std::string err;
-  parse(out, s.begin(), s.end(), &err);
+  auto end = parse(out, s.begin(), s.end(), &err);
+  while (end != s.end() && std::isspace(static_cast<unsigned char>(*end))) ++end;
+  if (err.empty() && end != s.end()) err = "trailing data after JSON value";
   return err;
 }
 
@@ -1115,14 +1151,89 @@ inline bool operator!=(const value &x, const value &y) {
 
 namespace internal {
 
+// Shared budgets apply before allocating parser trees, including optional backends.
+inline constexpr size_t max_config_bytes = 1024 * 1024;
+inline constexpr size_t max_config_entries = 4096;
+inline constexpr size_t max_config_depth = 64;
+inline constexpr size_t max_key_bytes = 1024;
+inline constexpr size_t max_value_bytes = 64 * 1024;
+
+inline bool json_within_limits(const std::string& content) {
+    if (content.size() > max_config_bytes) return false;
+    size_t depth = 0, entries = 0, string_bytes = 0;
+    bool quoted = false, escaped = false;
+    for (unsigned char c : content) {
+        if (quoted) {
+            if (++string_bytes > max_value_bytes) return false;
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') quoted = false;
+        } else if (c == '"') {
+            quoted = true;
+            string_bytes = 0;
+        } else if (c == '{' || c == '[') {
+            if (++depth > max_config_depth || ++entries > max_config_entries) return false;
+        } else if (c == '}' || c == ']') {
+            if (depth == 0) return false;
+            --depth;
+        } else if (c == ',') {
+            if (++entries > max_config_entries) return false;
+        }
+    }
+    return !quoted && depth == 0;
+}
+
+inline std::string safe_log_message(const std::string& input) {
+    std::string output;
+    constexpr char hex[] = "0123456789ABCDEF";
+    for (unsigned char c : input) {
+        if (output.size() >= 2048) { output += " [truncated]"; break; }
+        if (c < 0x20 || c == 0x7f || c == 0x1b) {
+            output += "\\x";
+            output += hex[c >> 4];
+            output += hex[c & 15];
+        } else output += static_cast<char>(c);
+    }
+    return output;
+}
+
+// Declare before acquiring instance locks. Nested scopes flush only at the
+// outer boundary, after all locks have been released.
+class DeferredCallbacks {
+    inline static thread_local DeferredCallbacks* active_ = nullptr;
+    DeferredCallbacks* previous_;
+    std::vector<std::function<void()>> pending_;
+public:
+    DeferredCallbacks() : previous_(active_) { active_ = this; }
+    DeferredCallbacks(const DeferredCallbacks&) = delete;
+    DeferredCallbacks& operator=(const DeferredCallbacks&) = delete;
+    ~DeferredCallbacks() noexcept {
+        active_ = previous_;
+        for (auto& callback : pending_) {
+            try { dispatch(std::move(callback)); }
+            catch (...) { default_log_handler(LogLevel::Error, "Diagnostic callback threw an exception"); }
+        }
+    }
+    static void dispatch(std::function<void()> callback) {
+        if (active_) active_->pending_.push_back(std::move(callback));
+        else callback();
+    }
+};
+
 /**
  * @brief Log output helper
  */
 inline void log(LogLevel level, const std::string& message) {
-    auto& callback = get_global_log_callback();
-    if (callback) {
-        callback(level, message);
-    }
+    auto callback = get_global_log_callback();
+    if (!callback) return;
+    DeferredCallbacks::dispatch([callback = std::move(callback), level, text = safe_log_message(message)] {
+        static thread_local bool delivering = false;
+        if (delivering) return; // A logger may query the API, but must not recursively log.
+        delivering = true;
+        try { callback(level, text); }
+        catch (...) { delivering = false; throw; }
+        delivering = false;
+    });
 }
 
 // ============================================================
@@ -1163,6 +1274,11 @@ struct FileReadResult {
     }
 };
 
+// Implemented with native handles: regular files only, no final symlink/reparse
+// point, and a bounded read even if the file grows after opening.
+FileReadResult read_regular_file(const std::filesystem::path& path);
+bool write_regular_file(const std::filesystem::path& path, const std::string& content, ErrorInfo& error);
+
 /**
  * @brief Read file contents with retry logic
  * 
@@ -1178,70 +1294,42 @@ struct FileReadResult {
 inline std::optional<std::string> read_file_with_retry(
     const std::filesystem::path& path,
     const FileReadRetryConfig& config = FileReadRetryConfig{},
-    ErrorInfo* error_out = nullptr) 
+    ErrorInfo* error_out = nullptr,
+    const std::atomic<bool>* cancelled = nullptr)
 {
+    // Invalid caller retry policies must not turn shutdown into an unbounded wait.
+    if (config.max_retries < 0 || config.max_retries > 16 || config.retry_delay.count() < 0 ||
+        config.retry_delay > std::chrono::seconds(1) || !std::isfinite(config.backoff_multiplier) ||
+        config.backoff_multiplier < 1.0 || config.backoff_multiplier > 4.0) {
+        if (error_out) *error_out = ErrorInfo(ErrorType::InvalidFormat, "Invalid file retry policy", path.string());
+        return std::nullopt;
+    }
     auto delay = config.retry_delay;
     ErrorInfo last_error;
     std::string path_str = path.string();
     
     for (int attempt = 0; attempt <= config.max_retries; ++attempt) {
+        if (cancelled && cancelled->load()) return std::nullopt;
         if (attempt > 0) {
-            std::this_thread::sleep_for(delay);
+            auto remaining = delay;
+            while (remaining.count() > 0) {
+                if (cancelled && cancelled->load()) return std::nullopt;
+                const auto step = std::min(remaining, std::chrono::milliseconds(20));
+                std::this_thread::sleep_for(step);
+                remaining -= step;
+            }
             delay = std::chrono::milliseconds(
-                static_cast<int>(delay.count() * config.backoff_multiplier));
+                static_cast<int>(std::min(1000.0, delay.count() * config.backoff_multiplier)));
         }
-        
-        std::error_code ec;
-        
-        // Check if file exists
-        if (!std::filesystem::exists(path, ec)) {
-            last_error = ErrorInfo(ErrorType::FileNotFound, 
-                                  "File does not exist", path_str);
-            if (attempt == 0) {
-                log(LogLevel::Warning, last_error.to_string());
-            }
-            continue;
-        }
-        if (ec) {
-            last_error = ErrorInfo(ErrorType::FileAccessDenied,
-                                  "Cannot access file: " + ec.message(), path_str);
-            if (attempt == 0) {
-                log(LogLevel::Warning, last_error.to_string());
-            }
-            continue;
-        }
-        
-        // Get file size (skip if 0 bytes)
-        auto file_size = std::filesystem::file_size(path, ec);
-        if (ec) {
-            last_error = ErrorInfo(ErrorType::FileReadError,
-                                  "Cannot get file size: " + ec.message(), path_str);
-            log(LogLevel::Debug, last_error.to_string());
-            continue;
-        }
-        if (file_size == 0) {
-            last_error = ErrorInfo(ErrorType::FileEmpty,
-                                  "File is empty", path_str);
-            log(LogLevel::Debug, last_error.to_string());
-            continue;
-        }
-        
-        // Open and read file
-        std::ifstream file(path, std::ios::binary);
-        if (!file) {
-            last_error = ErrorInfo(ErrorType::FileAccessDenied,
-                                  "Cannot open file for reading", path_str);
-            log(LogLevel::Debug, last_error.to_string());
-            continue;
-        }
-        
-        std::string content;
-        content.reserve(static_cast<size_t>(file_size));
         
         try {
-            content.assign(
-                std::istreambuf_iterator<char>(file),
-                std::istreambuf_iterator<char>());
+            auto result = read_regular_file(path);
+            if (result) {
+                if (error_out) *error_out = ErrorInfo{};
+                return std::move(result.content);
+            }
+            last_error = std::move(result.error);
+            if (last_error.type == ErrorType::InvalidFormat) break;
         } catch (const std::exception& e) {
             last_error = ErrorInfo(ErrorType::FileReadError,
                                   std::string("Exception during file read: ") + e.what(), path_str);
@@ -1254,25 +1342,6 @@ inline std::optional<std::string> read_file_with_retry(
             continue;
         }
         
-        // Verify successful read and expected size
-        // (When writing, file size and actual read amount may differ)
-        if (file.good() || file.eof()) {
-            // Verify content is not empty
-            if (!content.empty()) {
-                if (error_out) {
-                    *error_out = ErrorInfo(); // No error
-                }
-                return content;
-            } else {
-                last_error = ErrorInfo(ErrorType::FileEmpty,
-                                      "File content is empty after read", path_str);
-                log(LogLevel::Debug, last_error.to_string());
-            }
-        } else {
-            last_error = ErrorInfo(ErrorType::FileReadError,
-                                  "File stream in bad state after read", path_str);
-            log(LogLevel::Debug, last_error.to_string());
-        }
     }
     
     // All retries failed
@@ -1327,7 +1396,7 @@ struct FileWatcherConfig {
  * @brief Cross-platform file watcher (PIMPL pattern)
  * 
  * Uses OS native APIs: Windows (ReadDirectoryChangesW), Linux (inotify), macOS (FSEvents).
- * Requires LIVETUNER_IMPLEMENTATION in one source file. Falls back to polling without it.
+ * Requires LIVETUNER_IMPLEMENTATION in one source file. Uses polling when native setup fails.
  */
 class FileWatcher {
 public:
@@ -1340,8 +1409,8 @@ public:
     FileWatcher(const FileWatcher&) = delete;
     FileWatcher& operator=(const FileWatcher&) = delete;
     
-    FileWatcher(FileWatcher&& other) noexcept;
-    FileWatcher& operator=(FileWatcher&& other) noexcept;
+    FileWatcher(FileWatcher&&) = delete;
+    FileWatcher& operator=(FileWatcher&&) = delete;
 
     /**
      * @brief Get file watcher configuration
@@ -1398,6 +1467,7 @@ private:
     FileWatcherConfig config_;
     
     bool start_native();
+    void signal_native();
     void stop_native();
     bool start_polling();
     void watch_polling();
@@ -1461,6 +1531,9 @@ inline bool parse_value(const std::string& str, T& value) {
         std::string remaining;
         iss >> remaining;
         if (remaining.empty()) {
+            if constexpr (std::is_floating_point_v<T>) {
+                if (!std::isfinite(temp)) return false;
+            }
             value = temp;
             return true;
         }
@@ -1512,18 +1585,21 @@ public:
     
     static bool parse(const std::string& content, ValueMap& result) {
         result.clear();
-        
-        picojson::value v;
-        std::string err = picojson::parse(v, content);
-        
-        if (!err.empty() || !v.is<picojson::object>()) {
+        if (!json_within_limits(content)) return false;
+        try {
+            picojson::value v;
+            std::string err;
+            auto end = picojson::parse(v, content.begin(), content.end(), &err);
+            while (end != content.end() && std::isspace(static_cast<unsigned char>(*end))) ++end;
+            if (!err.empty() || end != content.end() || !v.is<picojson::object>()) return false;
+            ValueMap candidate;
+            flatten_object(v.get<picojson::object>(), "", candidate);
+            result = std::move(candidate);
+            return true;
+        } catch (const std::exception&) {
+            result.clear();
             return false;
         }
-        
-        const picojson::object& obj = v.get<picojson::object>();
-        flatten_object(obj, "", result);
-        
-        return !result.empty();
     }
 
 private:
@@ -1544,21 +1620,10 @@ private:
         
         // For floating-point values, format properly
         std::ostringstream oss;
-        oss << std::fixed << value;
+        oss << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
         std::string str = oss.str();
         
-        // Remove trailing zeros after decimal point
-        size_t dot_pos = str.find('.');
-        if (dot_pos != std::string::npos) {
-            size_t last_non_zero = str.find_last_not_of('0');
-            if (last_non_zero != std::string::npos && last_non_zero > dot_pos) {
-                str = str.substr(0, last_non_zero + 1);
-            } else if (last_non_zero == dot_pos) {
-                // All zeros after decimal point, remove decimal point too
-                str = str.substr(0, dot_pos);
-            }
-        }
-        
+        // Preserve small finite values and scientific notation without rounding.
         return str;
     }
     
@@ -1573,9 +1638,16 @@ private:
         for (const auto& kv : obj) {
             std::string key = prefix.empty() ? kv.first : prefix + "." + kv.first;
             const picojson::value& val = kv.second;
+            if (key.size() > max_key_bytes || result.size() >= max_config_entries ||
+                (val.is<std::string>() && val.get<std::string>().size() > max_value_bytes))
+                throw std::length_error("configuration entry exceeds resource limits");
             
             if (val.is<std::string>()) {
                 result[key] = val.get<std::string>();
+#ifdef PICOJSON_USE_INT64
+            } else if (val.is<int64_t>()) {
+                result[key] = std::to_string(val.get<int64_t>());
+#endif
             } else if (val.is<double>()) {
                 result[key] = double_to_string(val.get<double>());
             } else if (val.is<bool>()) {
@@ -1603,9 +1675,16 @@ private:
         for (size_t i = 0; i < arr.size(); ++i) {
             std::string key = prefix + "." + std::to_string(i);
             const picojson::value& val = arr[i];
+            if (key.size() > max_key_bytes || result.size() >= max_config_entries ||
+                (val.is<std::string>() && val.get<std::string>().size() > max_value_bytes))
+                throw std::length_error("configuration entry exceeds resource limits");
             
             if (val.is<std::string>()) {
                 result[key] = val.get<std::string>();
+#ifdef PICOJSON_USE_INT64
+            } else if (val.is<int64_t>()) {
+                result[key] = std::to_string(val.get<int64_t>());
+#endif
             } else if (val.is<double>()) {
                 result[key] = double_to_string(val.get<double>());
             } else if (val.is<bool>()) {
@@ -1635,6 +1714,10 @@ public:
     
     static bool parse(const std::string& content, ValueMap& result, bool yaml_style = false) {
         result.clear();
+        if (content.size() > max_config_bytes) return false;
+        try {
+        ValueMap candidate;
+        size_t entries = 0;
         
         std::istringstream stream(content);
         std::string line;
@@ -1677,12 +1760,18 @@ public:
                 }
                 
                 if (!key.empty()) {
-                    result[key] = value;
-                }
-            }
+                    if (++entries > max_config_entries || key.size() > max_key_bytes ||
+                        value.size() > max_value_bytes) return false;
+                    candidate[key] = value;
+                } else return false;
+            } else return false;
         }
-        
-        return !result.empty();
+        result = std::move(candidate);
+        return true;
+        } catch (const std::exception&) {
+            result.clear();
+            return false;
+        }
     }
 };
 
@@ -1733,7 +1822,8 @@ private:
     // Base class for holding binding information
     struct BindingBase {
         virtual ~BindingBase() = default;
-        virtual bool update(const std::string& str_value) = 0;
+        virtual bool prepare(const std::string* str_value) = 0;
+        virtual void commit() = 0;
         virtual void apply_default() = 0;
     };
     
@@ -1741,12 +1831,17 @@ private:
     struct Binding : public BindingBase {
         T* target;
         T default_value;
+        std::optional<T> prepared;
         
         Binding(T* t, T def) : target(t), default_value(def) {}
         
-        bool update(const std::string& str_value) override {
-            return internal::parse_value(str_value, *target);
+        bool prepare(const std::string* str_value) override {
+            T value = default_value;
+            if (str_value && !internal::parse_value(*str_value, value)) return false;
+            prepared = std::move(value);
+            return true;
         }
+        void commit() override { *target = std::move(*prepared); prepared.reset(); }
         
         void apply_default() override {
             *target = default_value;
@@ -1769,7 +1864,7 @@ private:
     internal::FileWatcherConfig file_watcher_config_;
     internal::FileReadRetryConfig file_read_retry_config_;
     bool use_event_driven_ = true;
-    std::atomic<bool> file_changed_{false};
+    std::shared_ptr<std::atomic<bool>> file_changed_ = std::make_shared<std::atomic<bool>>(false);
     
     // Error information
     ErrorInfo last_error_;
@@ -1885,6 +1980,8 @@ public:
      * main-thread-only resources like OpenGL/DirectX contexts.
      */
     bool update() {
+        internal::DeferredCallbacks diagnostics;
+        if (!LIVETUNER_ENABLE_RUNTIME) return false;
         // Prevent reentrancy during callback execution
         if (in_callback_.load()) {
             internal::log(LogLevel::Debug, 
@@ -1898,14 +1995,12 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             
-            ensure_file_exists();
             
             auto now = std::chrono::steady_clock::now();
             auto current_modify_time = internal::get_file_modify_time(file_path_);
             
             // Cache check
             if (file_cache_.file_exists && 
-                (now - file_cache_.last_access) < FileCache::cache_duration &&
                 current_modify_time == file_cache_.last_modify_time) {
                 return false;
             }
@@ -1914,7 +2009,7 @@ public:
             
             file_cache_.last_modify_time = current_modify_time;
             file_cache_.last_access = now;
-            file_cache_.file_exists = true;
+            file_cache_.file_exists = !last_error_;
             
             // Copy callback and invoke outside lock (prevent deadlock)
             if (updated && on_change_callback_) {
@@ -1944,6 +2039,7 @@ public:
      * Monitors file in background and marks file as changed; call poll() from main loop on changes.
      */
     void start_watching() {
+        if (!LIVETUNER_ENABLE_RUNTIME) return;
         // Skip processing during callback execution (prevent reentrancy)
         if (in_callback_.load()) {
             internal::log(LogLevel::Warning, 
@@ -1958,11 +2054,11 @@ public:
         }
         
         file_watcher_ = std::make_unique<internal::FileWatcher>(file_watcher_config_);
-        file_changed_.store(true); // Initial read
-        
-        file_watcher_->start(file_path_, [this] {
-            file_changed_.store(true);
-        });
+        if (!file_changed_) file_changed_ = std::make_shared<std::atomic<bool>>(false);
+        file_changed_->store(true); // Initial read
+        if (!file_watcher_->start(file_path_, [changed = file_changed_] {
+            changed->store(true);
+        })) last_error_ = ErrorInfo(ErrorType::WatcherError, "Cannot start file watcher", file_path_);
     }
 
     /**
@@ -1991,11 +2087,12 @@ public:
      * @return true if values were updated
      */
     bool poll() {
-        if (file_changed_.load()) {
-            file_changed_.store(false);
-            return update();
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!file_changed_ || !file_changed_->exchange(false)) return false;
+            file_cache_.file_exists = false;
         }
-        return false;
+        return update();
     }
 
     /**
@@ -2080,13 +2177,13 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         file_path_ = file_path;
         format_ = (format == FileFormat::Auto) ? internal::detect_format(file_path_) : format;
-        invalidate_cache();
+        invalidate_cache_locked();
         
         // If watching, restart
         if (file_watcher_ && file_watcher_->is_running()) {
             file_watcher_->stop();
-            file_watcher_->start(file_path_, [this] {
-                file_changed_.store(true);
+            file_watcher_->start(file_path_, [changed = file_changed_] {
+                changed->store(true);
             });
         }
     }
@@ -2107,12 +2204,8 @@ public:
             return;
         }
         
-        file_cache_ = FileCache{
-            std::filesystem::file_time_type::min(),
-            std::chrono::steady_clock::time_point{},
-            false
-        };
-        current_values_.clear();
+        std::lock_guard<std::mutex> lock(mtx_);
+        invalidate_cache_locked();
     }
 
     /**
@@ -2146,30 +2239,9 @@ public:
     }
 
 private:
-    void ensure_file_exists() {
-        if (!std::filesystem::exists(file_path_)) {
-            std::ofstream file(file_path_);
-            if (file) {
-                switch (format_) {
-                case FileFormat::Json:
-                    file << "{\n";
-                    file << "  // Live Tuner parameters\n";
-                    file << "  // Edit values here and save\n";
-                    file << "}\n";
-                    break;
-                case FileFormat::Yaml:
-                    file << "# Live Tuner parameters\n";
-                    file << "# Edit values here and save\n";
-                    file << "---\n";
-                    break;
-                default:
-                    file << "# Live Tuner parameters\n";
-                    file << "# Format: key = value\n";
-                    file << "\n";
-                    break;
-                }
-            }
-        }
+    void invalidate_cache_locked() {
+        file_cache_ = FileCache{};
+        current_values_.clear();
     }
 
     bool load_file() {
@@ -2189,7 +2261,7 @@ private:
         switch (format_) {
         case FileFormat::Json:
             parsed = internal::PicojsonParser::parse(content, new_values);
-            if (!parsed && new_values.empty()) {
+            if (!parsed) {
                 last_error_ = ErrorInfo(ErrorType::ParseError, 
                                        "Failed to parse JSON format", file_path_);
                 internal::log(LogLevel::Error, last_error_.to_string());
@@ -2197,7 +2269,7 @@ private:
             break;
         case FileFormat::Yaml:
             parsed = internal::SimpleKeyValueParser::parse(content, new_values, true);
-            if (!parsed && new_values.empty()) {
+            if (!parsed) {
                 last_error_ = ErrorInfo(ErrorType::ParseError, 
                                        "Failed to parse YAML format", file_path_);
                 internal::log(LogLevel::Error, last_error_.to_string());
@@ -2207,7 +2279,7 @@ private:
         case FileFormat::Plain:
         default:
             parsed = internal::SimpleKeyValueParser::parse(content, new_values, false);
-            if (!parsed && new_values.empty()) {
+            if (!parsed) {
                 last_error_ = ErrorInfo(ErrorType::ParseError, 
                                        "Failed to parse key-value format", file_path_);
                 internal::log(LogLevel::Error, last_error_.to_string());
@@ -2215,7 +2287,7 @@ private:
             break;
         }
         
-        if (!parsed && new_values.empty()) {
+        if (!parsed) {
             return false;
         }
         
@@ -2233,23 +2305,19 @@ private:
             return false;
         }
         
-        current_values_ = std::move(new_values);
-        
-        // Update bound variables
+        // Validate every bound value before publishing any of the new snapshot.
         for (auto& [name, binding] : bindings_) {
-            auto it = current_values_.find(name);
-            if (it != current_values_.end()) {
-                if (!binding->update(it->second)) {
-                    // Record parse failure (warning level)
-                    std::string msg = "Failed to parse value for parameter '" + name + 
-                                    "': '" + it->second + "'";
-                    internal::log(LogLevel::Warning, msg);
-                }
-            } else {
-                binding->apply_default();
+            auto it = new_values.find(name);
+            if (!binding->prepare(it == new_values.end() ? nullptr : &it->second)) {
+                last_error_ = ErrorInfo(ErrorType::ParseError,
+                    "Invalid value for parameter '" + name + "'", file_path_);
+                internal::log(LogLevel::Warning, last_error_.to_string());
+                return false;
             }
         }
-        
+        for (auto& [name, binding] : bindings_) binding->commit();
+        current_values_ = std::move(new_values);
+
         // Clear error on success
         last_error_ = ErrorInfo();
         
@@ -2267,553 +2335,278 @@ private:
  * @warning Event-driven callbacks run on background thread.
  * Not safe for OpenGL/DirectX. Use Params class for main-thread execution.
  */
+class AsyncCancelled : public std::runtime_error {
+public:
+    AsyncCancelled() : std::runtime_error("LiveTuner asynchronous read cancelled") {}
+};
+
 class LiveTuner {
 public:
     struct FileCache {
-        std::filesystem::file_time_type last_modify_time;
-        std::chrono::steady_clock::time_point last_access;
+        std::filesystem::file_time_type last_modify_time{};
+        std::chrono::steady_clock::time_point last_access{};
         bool file_exists = false;
         static constexpr std::chrono::milliseconds cache_duration{10};
     };
-
 private:
+    struct ReadConfig {
+        std::string path;
+        internal::FileWatcherConfig watcher;
+        internal::FileReadRetryConfig retry;
+        bool event_driven;
+    };
+    struct AsyncState {
+        std::atomic<bool> cancelled{false};
+        std::atomic<bool> done{false};
+    };
+    struct AsyncTask {
+        std::shared_ptr<AsyncState> state = std::make_shared<AsyncState>();
+        std::thread worker;
+    };
     mutable std::mutex mtx_;
     std::string input_file_path_ = "params.txt";
-    FileCache file_cache_{
-        std::filesystem::file_time_type::min(),
-        std::chrono::steady_clock::time_point{},
-        false
-    };
-    std::unique_ptr<internal::FileWatcher> file_watcher_;
+    FileCache file_cache_{};
     internal::FileWatcherConfig file_watcher_config_;
     internal::FileReadRetryConfig file_read_retry_config_;
     bool use_event_driven_ = true;
-    
-    // Error information
     ErrorInfo last_error_;
+    std::vector<std::unique_ptr<AsyncTask>> async_tasks_;
+
+    ReadConfig read_config() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return {input_file_path_, file_watcher_config_, file_read_retry_config_, use_event_driven_};
+    }
+
+    template<typename T>
+    static bool read_value(const ReadConfig& config, T& value, ErrorInfo& error,
+                           const std::atomic<bool>* cancelled = nullptr) {
+        auto content = internal::read_file_with_retry(config.path, config.retry, &error, cancelled);
+        if (!content) return false;
+        try {
+            std::istringstream stream(*content);
+            std::string line;
+            while (std::getline(stream, line)) {
+                line = internal::trim(line);
+                if (line.empty() || line[0] == '#') continue;
+                if (line.size() > internal::max_value_bytes) break;
+                T candidate{};
+                if (internal::parse_value(line, candidate)) {
+                    value = std::move(candidate);
+                    error = {};
+                    return true;
+                }
+            }
+        } catch (const std::exception&) {
+            // User-defined extraction can fail; keep the previously accepted value.
+        }
+        error = ErrorInfo(ErrorType::ParseError, "No valid value found in file", config.path);
+        return false;
+    }
+
+    template<typename T>
+    static bool wait_value(const ReadConfig& config, T& value,
+                           std::optional<std::chrono::milliseconds> timeout,
+                           const std::shared_ptr<AsyncState>& state, ErrorInfo& error) {
+        if (!LIVETUNER_ENABLE_RUNTIME) {
+            error = ErrorInfo(ErrorType::Disabled, "Runtime tuning is disabled", config.path);
+            return false;
+        }
+        internal::FileWatcher watcher(config.watcher);
+        const bool watching = config.event_driven && watcher.start(config.path, [] {});
+        const auto started = std::chrono::steady_clock::now();
+        for (;;) {
+            if (state && state->cancelled.load()) return false;
+            if (read_value(config, value, error, state ? &state->cancelled : nullptr)) return true;
+            auto interval = std::chrono::milliseconds(20);
+            if (timeout) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started);
+                if (elapsed >= *timeout) {
+                    error = ErrorInfo(ErrorType::Timeout, "Timeout waiting for valid value", config.path);
+                    return false;
+                }
+                interval = std::min(interval, *timeout - elapsed);
+            }
+            if (watching) watcher.wait_for_change(interval);
+            else std::this_thread::sleep_for(interval);
+        }
+    }
+
+    template<typename Work>
+    void start_async(Work work) {
+        // Keep an outer owner until the lock is released, including thread-creation
+        // failure. Destructors of callback captures can execute application code.
+        auto operation = std::make_shared<Work>(std::move(work));
+        std::lock_guard<std::mutex> lock(mtx_);
+        // Completed tasks no longer execute user code and can be reaped under lock.
+        for (auto it = async_tasks_.begin(); it != async_tasks_.end();) {
+            if ((*it)->state->done.load()) {
+                (*it)->worker.join();
+                it = async_tasks_.erase(it);
+            } else ++it;
+        }
+        auto task = std::make_unique<AsyncTask>();
+        auto state = task->state;
+        async_tasks_.push_back(std::move(task));
+        try {
+            async_tasks_.back()->worker = std::thread([state, operation]() mutable {
+                try { (*operation)(state); }
+                catch (...) {
+                    try { internal::log(LogLevel::Error, "Asynchronous callback threw an exception"); }
+                    catch (...) { internal::default_log_handler(LogLevel::Error, "Asynchronous callback and logger failed"); }
+                }
+                operation.reset();
+                state->done.store(true);
+            });
+        } catch (...) {
+            async_tasks_.pop_back();
+            throw;
+        }
+    }
+
+    void stop_async() {
+        std::vector<std::unique_ptr<AsyncTask>> tasks;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            tasks.swap(async_tasks_);
+        }
+        for (auto& task : tasks) task->state->cancelled.store(true);
+        for (auto& task : tasks) {
+            if (!task->worker.joinable()) continue;
+            if (task->worker.get_id() == std::this_thread::get_id()) {
+                // A callback may destroy its owner. This worker owns only copied
+                // config/state and callback captures; it never accesses the owner.
+                task->worker.detach();
+            } else task->worker.join();
+        }
+    }
+
+    void invalidate_cache_locked() { file_cache_ = FileCache{}; }
 
 public:
     LiveTuner() = default;
-    
-    explicit LiveTuner(std::string_view file_path) : input_file_path_(file_path) {}
-    
-    /**
-     * @brief Get file read retry configuration
-     */
-    const internal::FileReadRetryConfig& get_read_retry_config() const {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return file_read_retry_config_;
-    }
-    
-    /**
-     * @brief Set file read retry configuration
-     * 
-     * Avoids conflicts while editor is writing (especially on Windows).
-     */
-    void set_read_retry_config(const internal::FileReadRetryConfig& config) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        file_read_retry_config_ = config;
-    }
-    
+    explicit LiveTuner(std::string_view path) : input_file_path_(path) {}
     LiveTuner(const LiveTuner&) = delete;
     LiveTuner& operator=(const LiveTuner&) = delete;
     LiveTuner(LiveTuner&&) noexcept;
     LiveTuner& operator=(LiveTuner&&) noexcept;
-    
     ~LiveTuner();
 
-    /**
-     * @brief Set file path to monitor
-     */
-    void set_file(std::string_view file_path) {
+    internal::FileReadRetryConfig get_read_retry_config() const {
         std::lock_guard<std::mutex> lock(mtx_);
-        input_file_path_ = file_path;
-        invalidate_cache();
+        return file_read_retry_config_;
     }
-    
-    std::string get_file() const {
+    void set_read_retry_config(const internal::FileReadRetryConfig& config) {
         std::lock_guard<std::mutex> lock(mtx_);
-        return input_file_path_;
+        file_read_retry_config_ = config;
     }
-
-    /**
-     * @brief Get file watcher configuration
-     */
-    const internal::FileWatcherConfig& get_watcher_config() const {
+    internal::FileWatcherConfig get_watcher_config() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return file_watcher_config_;
     }
-    
-    /**
-     * @brief Set file watcher configuration
-     */
     void set_watcher_config(const internal::FileWatcherConfig& config) {
         std::lock_guard<std::mutex> lock(mtx_);
         file_watcher_config_ = config;
         file_watcher_config_.validate();
-        
-        if (file_watcher_) {
-            file_watcher_->set_config(file_watcher_config_);
-        }
     }
-
-    /**
-     * @brief Enable/disable event-driven mode
-     */
+    void set_file(std::string_view path) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        input_file_path_ = path;
+        invalidate_cache_locked();
+    }
+    std::string get_file() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return input_file_path_;
+    }
     void set_event_driven(bool enabled) {
         std::lock_guard<std::mutex> lock(mtx_);
         use_event_driven_ = enabled;
-        if (file_watcher_) {
-            file_watcher_->stop();
-            file_watcher_.reset();
-        }
     }
-    
     bool is_event_driven() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return use_event_driven_;
     }
-    
-    static bool has_native_file_watch() {
-        return internal::FileWatcher::has_native_support();
-    }
-
-    /**
-     * @brief Get last error information
-     */
+    static bool has_native_file_watch() { return internal::FileWatcher::has_native_support(); }
     ErrorInfo last_error() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return last_error_;
     }
-    
-    /**
-     * @brief Check if there is an error
-     */
-    bool has_error() const {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return static_cast<bool>(last_error_);
-    }
-    
-    /**
-     * @brief Clear error
-     */
+    bool has_error() const { return static_cast<bool>(last_error()); }
     void clear_error() {
         std::lock_guard<std::mutex> lock(mtx_);
-        last_error_ = ErrorInfo();
+        last_error_ = {};
     }
 
-    /**
-     * @brief Try to read value immediately (non-blocking)
-     * 
-     * Updates value only when file has changed.
-     * Optimal for game loops and frequent calls.
-     * Built-in retry logic to avoid file write conflicts with editors.
-     * 
-     * @param value Variable to store read value
-     * @return true if value was updated
-     * 
-     * @note Thread-safe: This method can be safely called from multiple threads.
-     *       The file cache is protected by mutex to prevent data races.
-     */
     template<typename T>
     bool try_get(T& value) {
-        std::string input_path;
-        internal::FileReadRetryConfig retry_config;
-        
-        auto now = std::chrono::steady_clock::now();
-        
-        // Phase 1: Check cache and get configuration (locked)
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            input_path = input_file_path_;
-            retry_config = file_read_retry_config_;
-        }
-        
-        ensure_file_exists(input_path);
-        
-        // Phase 2: Get current file modification time (unlocked - filesystem operation)
-        auto current_modify_time = internal::get_file_modify_time(input_path);
-        
-        // Phase 3: Re-check cache with modification time (locked)
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            // Early return if within cache valid period and modification time is same
-            if (file_cache_.file_exists && 
-                (now - file_cache_.last_access) < FileCache::cache_duration &&
-                current_modify_time == file_cache_.last_modify_time) {
-                return false;
-            }
-        }
-        
-        // Phase 4: Read file (unlocked - I/O operation)
-        ErrorInfo read_error;
-        auto content_opt = internal::read_file_with_retry(input_path, retry_config, &read_error);
-        if (!content_opt) {
-            std::lock_guard<std::mutex> lock(mtx_);
-            last_error_ = read_error;
-            file_cache_.file_exists = false;
-            file_cache_.last_access = now;
+        internal::DeferredCallbacks diagnostics;
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!LIVETUNER_ENABLE_RUNTIME) {
+            last_error_ = ErrorInfo(ErrorType::Disabled, "Runtime tuning is disabled", input_file_path_);
             return false;
         }
-        
-        // Phase 5: Parse content (unlocked - CPU operation)
-        std::istringstream stream(*content_opt);
-        std::string line;
-        bool value_found = false;
-        T parsed_value{};
-        std::string failed_line;
-        bool parse_error = false;
-        
-        while (std::getline(stream, line)) {
-            line = internal::trim(line);
-            
-            if (!line.empty() && line[0] != '#') {
-                if (internal::parse_value(line, parsed_value)) {
-                    value_found = true;
-                    break;
-                } else {
-                    // Parse failure - save for error reporting
-                    failed_line = line;
-                    parse_error = true;
-                }
-            }
-        }
-        
-        // Phase 6: Update cache and state (locked)
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            
-            if (value_found) {
-                // On success, clear error and update cache
-                value = std::move(parsed_value);
-                file_cache_.last_modify_time = current_modify_time;
-                file_cache_.last_access = now;
-                file_cache_.file_exists = true;
-                last_error_ = ErrorInfo();
-                return true;
-            }
-            
-            if (parse_error) {
-                last_error_ = ErrorInfo(ErrorType::ParseError,
-                                      "Failed to parse value from line: '" + failed_line + "'",
-                                      input_path);
-                internal::log(LogLevel::Warning, last_error_.to_string());
-            } else {
-                last_error_ = ErrorInfo(ErrorType::ParseError,
-                                      "No valid value found in file",
-                                      input_path);
-                internal::log(LogLevel::Debug, last_error_.to_string());
-            }
-            
-            file_cache_.last_modify_time = current_modify_time;
-            file_cache_.last_access = now;
-            file_cache_.file_exists = true;
-        }
-        
-        return false;
+        const auto modified = internal::get_file_modify_time(input_file_path_);
+        if (file_cache_.file_exists && modified == file_cache_.last_modify_time) return false;
+        const ReadConfig config{input_file_path_, file_watcher_config_, file_read_retry_config_, use_event_driven_};
+        const bool read = read_value(config, value, last_error_);
+        file_cache_ = {modified, std::chrono::steady_clock::now(), read};
+        if (!read) internal::log(LogLevel::Warning, last_error_.to_string());
+        return read;
     }
 
-    /**
-     * @brief Block until value is read
-     */
     template<typename T>
     void get(T& value) {
-        std::string input_path;
-        bool event_driven;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            input_path = input_file_path_;
-            event_driven = use_event_driven_;
-        }
-        
-        ensure_file_exists(input_path);
-        
-        if (event_driven) {
-            get_event_driven(value, input_path);
-        } else {
-            get_polling(value, input_path);
-        }
+        const auto config = read_config();
+        ErrorInfo error;
+        wait_value(config, value, std::nullopt, nullptr, error);
+        std::lock_guard<std::mutex> lock(mtx_);
+        last_error_ = std::move(error);
     }
-
-    /**
-     * @brief Read value with timeout
-     */
     template<typename T>
     bool get_timeout(T& value, std::chrono::milliseconds timeout) {
-        std::string input_path;
-        bool event_driven;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            input_path = input_file_path_;
-            event_driven = use_event_driven_;
-        }
-        
-        ensure_file_exists(input_path);
-        
-        if (event_driven) {
-            return get_timeout_event_driven(value, input_path, timeout);
-        } else {
-            return get_timeout_polling(value, input_path, timeout);
-        }
+        const auto config = read_config();
+        ErrorInfo error;
+        const bool read = wait_value(config, value, timeout, nullptr, error);
+        std::lock_guard<std::mutex> lock(mtx_);
+        last_error_ = std::move(error);
+        return read;
     }
 
-    /**
-     * @brief Read value asynchronously (future version)
-     */
     template<typename T>
     std::future<T> get_async() {
-        return std::async(std::launch::async, [this]() {
-            T value{};
-            get(value);
-            return value;
+        auto promise = std::make_shared<std::promise<T>>();
+        auto future = promise->get_future();
+        start_async([config = read_config(), promise](const auto& state) {
+            try {
+                T value{};
+                ErrorInfo error;
+                if (!wait_value(config, value, std::nullopt, state, error) || state->cancelled.load()) {
+                    if (error.type == ErrorType::Disabled) throw std::runtime_error(error.to_string());
+                    throw AsyncCancelled{};
+                }
+                promise->set_value(std::move(value));
+            } catch (...) { promise->set_exception(std::current_exception()); }
         });
+        return future;
     }
-
-    /**
-     * @brief Read value asynchronously (callback version)
-     */
     template<typename T, typename Callback>
     void get_async(Callback callback) {
-        std::thread([this, callback = std::move(callback)]() {
+        start_async([config = read_config(), callback = std::move(callback)](const auto& state) mutable {
             T value{};
-            get(value);
-            callback(value);
-        }).detach();
+            ErrorInfo error;
+            if (wait_value(config, value, std::nullopt, state, error) && !state->cancelled.load())
+                callback(std::move(value));
+        });
     }
-
-    /**
-     * @brief Invalidate cache
-     */
     void invalidate_cache() {
-        file_cache_ = FileCache{
-            std::filesystem::file_time_type::min(),
-            std::chrono::steady_clock::time_point{},
-            false
-        };
-    }
-
-    /**
-     * @brief Reset state (clear cache)
-     */
-    void reset() {
         std::lock_guard<std::mutex> lock(mtx_);
-        // Don't reset file path (maintain path set by set_file)
-        if (file_watcher_) {
-            file_watcher_->stop();
-            file_watcher_.reset();
-        }
-        invalidate_cache();
+        invalidate_cache_locked();
     }
-
-private:
-    void ensure_file_exists(const std::string& path) {
-        if (!std::filesystem::exists(path)) {
-            std::ofstream file(path);
-            if (file) {
-                file << "# Live Tuner parameters (edit values here)\n";
-                file << "# Lines starting with # are comments\n";
-            }
-        }
-    }
-
-    template<typename T>
-    void get_event_driven(T& value, const std::string& input_path) {
-        auto watcher = std::make_unique<internal::FileWatcher>(file_watcher_config_);
-        std::atomic<bool> file_changed{true};
-        
-        internal::FileReadRetryConfig retry_config;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            retry_config = file_read_retry_config_;
-        }
-        
-        if (!watcher->start(input_path, [&file_changed] {
-            file_changed.store(true);
-        })) {
-            std::lock_guard<std::mutex> lock(mtx_);
-            last_error_ = ErrorInfo(ErrorType::WatcherError,
-                                  "Failed to start file watcher, falling back to polling mode",
-                                  input_path);
-            internal::log(LogLevel::Warning, last_error_.to_string());
-            internal::log(LogLevel::Info, 
-                "LiveTuner: Event-driven file watching failed for '" + input_path + "'. "
-                "Falling back to polling mode (100ms interval). "
-                "This may occur due to: OS watcher resource limits, unsupported filesystem, "
-                "or permission issues. Performance may be slightly reduced.");
-            get_polling(value, input_path);
-            return;
-        }
-        
-        bool value_read = false;
-        while (!value_read) {
-            if (file_changed.load()) {
-                file_changed.store(false);
-                
-                // Read file with retry logic
-                ErrorInfo read_error;
-                auto content_opt = internal::read_file_with_retry(input_path, retry_config, &read_error);
-                if (content_opt) {
-                    std::istringstream stream(*content_opt);
-                    std::string line;
-                    bool parsed = false;
-                    while (std::getline(stream, line)) {
-                        line = internal::trim(line);
-                        
-                        if (!line.empty() && line[0] != '#') {
-                            if (internal::parse_value(line, value)) {
-                                value_read = true;
-                                parsed = true;
-                                std::lock_guard<std::mutex> lock(mtx_);
-                                last_error_ = ErrorInfo(); // Clear error on success
-                                break;
-                            }
-                        }
-                    }
-                    if (!parsed) {
-                        std::lock_guard<std::mutex> lock(mtx_);
-                        last_error_ = ErrorInfo(ErrorType::ParseError,
-                                              "No valid value found in file",
-                                              input_path);
-                        internal::log(LogLevel::Debug, last_error_.to_string());
-                    }
-                } else {
-                    std::lock_guard<std::mutex> lock(mtx_);
-                    last_error_ = read_error;
-                }
-            }
-            
-            if (!value_read) {
-                watcher->wait_for_change(std::chrono::milliseconds(1000));
-            }
-        }
-        
-        watcher->stop();
-    }
-    
-    template<typename T>
-    void get_polling(T& value, const std::string& input_path) {
-        internal::FileReadRetryConfig retry_config;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            retry_config = file_read_retry_config_;
-        }
-        
-        bool value_read = false;
-        
-        while (!value_read) {
-            // Read file with retry logic
-            ErrorInfo read_error;
-            auto content_opt = internal::read_file_with_retry(input_path, retry_config, &read_error);
-            if (content_opt) {
-                std::istringstream stream(*content_opt);
-                std::string line;
-                bool parsed = false;
-                while (std::getline(stream, line)) {
-                    line = internal::trim(line);
-                    
-                    if (!line.empty() && line[0] != '#') {
-                        if (internal::parse_value(line, value)) {
-                            value_read = true;
-                            parsed = true;
-                            std::lock_guard<std::mutex> lock(mtx_);
-                            last_error_ = ErrorInfo(); // Clear error on success
-                            break;
-                        }
-                    }
-                }
-                if (!parsed) {
-                    std::lock_guard<std::mutex> lock(mtx_);
-                    last_error_ = ErrorInfo(ErrorType::ParseError,
-                                          "No valid value found in file",
-                                          input_path);
-                    internal::log(LogLevel::Debug, last_error_.to_string());
-                }
-            } else {
-                std::lock_guard<std::mutex> lock(mtx_);
-                last_error_ = read_error;
-            }
-            
-            if (!value_read) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-    }
-
-    template<typename T>
-    bool get_timeout_event_driven(T& value, const std::string& input_path, 
-                                  std::chrono::milliseconds timeout) {
-        auto watcher = std::make_unique<internal::FileWatcher>(file_watcher_config_);
-        std::atomic<bool> file_changed{true};
-        
-        if (!watcher->start(input_path, [&file_changed] {
-            file_changed.store(true);
-        })) {
-            std::lock_guard<std::mutex> lock(mtx_);
-            last_error_ = ErrorInfo(ErrorType::WatcherError,
-                                  "Failed to start file watcher, falling back to polling mode",
-                                  input_path);
-            internal::log(LogLevel::Warning, last_error_.to_string());
-            internal::log(LogLevel::Info, 
-                "LiveTuner: Event-driven file watching failed for '" + input_path + "'. "
-                "Falling back to polling mode with timeout. "
-                "This may occur due to: OS watcher resource limits, unsupported filesystem, "
-                "or permission issues.");
-            return get_timeout_polling(value, input_path, timeout);
-        }
-        
-        auto start_time = std::chrono::steady_clock::now();
-        
-        while (true) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start_time
-            );
-            
-            if (elapsed >= timeout) {
-                watcher->stop();
-                std::lock_guard<std::mutex> lock(mtx_);
-                last_error_ = ErrorInfo(ErrorType::Timeout,
-                                      "Timeout waiting for valid value",
-                                      input_path);
-                internal::log(LogLevel::Warning, last_error_.to_string());
-                return false;
-            }
-            
-            if (file_changed.load()) {
-                file_changed.store(false);
-                
-                if (try_get(value)) {
-                    watcher->stop();
-                    return true;
-                }
-            }
-            
-            auto remaining = timeout - elapsed;
-            watcher->wait_for_change(std::min(remaining, std::chrono::milliseconds(100)));
-        }
-    }
-    
-    template<typename T>
-    bool get_timeout_polling(T& value, const std::string& input_path,
-                             std::chrono::milliseconds timeout) {
-        auto start_time = std::chrono::steady_clock::now();
-        
-        while (true) {
-            auto elapsed = std::chrono::steady_clock::now() - start_time;
-            if (elapsed >= timeout) {
-                std::lock_guard<std::mutex> lock(mtx_);
-                last_error_ = ErrorInfo(ErrorType::Timeout,
-                                      "Timeout waiting for valid value",
-                                      input_path);
-                internal::log(LogLevel::Warning, last_error_.to_string());
-                return false;
-            }
-            
-            if (try_get(value)) {
-                return true;
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+    void reset() {
+        stop_async();
+        std::lock_guard<std::mutex> lock(mtx_);
+        invalidate_cache_locked();
+        last_error_ = {};
     }
 };
 
@@ -3143,6 +2936,73 @@ inline void reset_all_globals() {
 #error "LIVETUNER_USE_NLOHMANN_JSON is defined but nlohmann/json.hpp is not included. Please #include <nlohmann/json.hpp> before LiveTuner.h"
 #endif
 
+namespace internal {
+// nlohmann's native arithmetic conversions can wrap or overflow without throwing.
+// Check before conversion, including the standard containers used by this adapter.
+template<typename T>
+struct JsonNumericRange {
+    static void validate(const nlohmann::json& value) {
+        bool valid = true;
+        if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+            if (value.is_number_unsigned()) {
+                valid = value.get<uint64_t>() <= static_cast<uint64_t>(std::numeric_limits<T>::max());
+            } else if (value.is_number_integer()) {
+                const auto number = value.get<int64_t>();
+                if constexpr (std::is_signed_v<T>) {
+                    valid = number >= static_cast<int64_t>(std::numeric_limits<T>::min()) &&
+                            number <= static_cast<int64_t>(std::numeric_limits<T>::max());
+                } else {
+                    valid = number >= 0 && static_cast<uint64_t>(number) <=
+                            static_cast<uint64_t>(std::numeric_limits<T>::max());
+                }
+            } else if (value.is_number_float()) {
+                const double number = std::trunc(value.get<double>());
+                // An exclusive power-of-two upper bound avoids rounding INT64_MAX
+                // up to 2^63 on platforms where long double is also 64-bit.
+                const double upper = std::ldexp(1.0, std::numeric_limits<T>::digits);
+                valid = std::isfinite(number) && number < upper &&
+                        number >= (std::is_signed_v<T> ? -upper : 0.0);
+            }
+        } else if constexpr (std::is_floating_point_v<T>) {
+            if (value.is_number()) {
+                const double number = value.get<double>();
+                valid = std::isfinite(number) && number <= std::numeric_limits<T>::max() &&
+                        number >= -std::numeric_limits<T>::max();
+            }
+        }
+        if (!valid) throw std::out_of_range("JSON number is outside the destination type range");
+    }
+};
+
+template<typename T, typename Allocator>
+struct JsonNumericRange<std::vector<T, Allocator>> {
+    static void validate(const nlohmann::json& value) {
+        if (value.is_array()) for (const auto& element : value) JsonNumericRange<T>::validate(element);
+    }
+};
+
+template<typename T, size_t N>
+struct JsonNumericRange<std::array<T, N>> {
+    static void validate(const nlohmann::json& value) {
+        if (value.is_array()) for (const auto& element : value) JsonNumericRange<T>::validate(element);
+    }
+};
+
+template<typename T, typename Compare, typename Allocator>
+struct JsonNumericRange<std::map<std::string, T, Compare, Allocator>> {
+    static void validate(const nlohmann::json& value) {
+        if (value.is_object()) for (const auto& element : value) JsonNumericRange<T>::validate(element);
+    }
+};
+
+template<typename T, typename Hash, typename Equal, typename Allocator>
+struct JsonNumericRange<std::unordered_map<std::string, T, Hash, Equal, Allocator>> {
+    static void validate(const nlohmann::json& value) {
+        if (value.is_object()) for (const auto& element : value) JsonNumericRange<T>::validate(element);
+    }
+};
+} // namespace internal
+
 /**
  * @brief Parameter management for nlohmann/json
  * 
@@ -3204,6 +3064,8 @@ public:
     {
         // Initial load
         load();
+
+        if (!LIVETUNER_ENABLE_RUNTIME) return;
         
         // Initialize FileWatcher
         internal::FileWatcherConfig config;
@@ -3230,6 +3092,7 @@ public:
      */
     bool update() {
         // Check for changes non-blocking (timeout 0ms)
+        if (!LIVETUNER_ENABLE_RUNTIME) return false;
         if (!watcher_->wait_for_change(std::chrono::milliseconds(0))) {
             return false;
         }
@@ -3245,6 +3108,7 @@ public:
      */
     template<typename T>
     T get(const std::string& json_path, const T& default_value = T{}) const {
+        internal::DeferredCallbacks diagnostics;
         std::lock_guard<std::mutex> lock(mutex_);
         
         try {
@@ -3252,6 +3116,7 @@ public:
             if (value.is_null()) {
                 return default_value;
             }
+            internal::JsonNumericRange<T>::validate(value);
             return value.get<T>();
         } catch (const std::exception& e) {
             handle_error(ErrorType::ParseError, 
@@ -3266,6 +3131,7 @@ public:
      * @return JSON object
      */
     json get_json(const std::string& json_path = "") const {
+        internal::DeferredCallbacks diagnostics;
         std::lock_guard<std::mutex> lock(mutex_);
         
         if (json_path.empty()) {
@@ -3302,14 +3168,18 @@ public:
      * @param callback Callback function called on error
      */
     void set_error_callback(ErrorCallback callback) {
-        error_callback_ = std::move(callback);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            error_callback_.swap(callback);
+        }
     }
 
     /**
      * @brief Get last error
      * @return Error information
      */
-    const ErrorInfo& last_error() const {
+    ErrorInfo last_error() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return last_error_;
     }
 
@@ -3319,21 +3189,17 @@ public:
      * @return true if successful
      */
     bool save(bool pretty = true) const {
+        internal::DeferredCallbacks diagnostics;
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!LIVETUNER_ENABLE_RUNTIME) return false;
         
         try {
-            std::ofstream file(file_path_);
-            if (!file) {
-                handle_error(ErrorType::FileAccessDenied, 
-                           "Failed to open file for writing: " + file_path_);
+            ErrorInfo error;
+            if (!internal::write_regular_file(file_path_, json_.dump(pretty ? 2 : -1), error)) {
+                handle_error(error.type, error.message);
                 return false;
             }
-            
-            if (pretty) {
-                file << json_.dump(2);  // 2-space indent
-            } else {
-                file << json_.dump();
-            }
+            last_error_ = {};
             
             return true;
         } catch (const std::exception& e) {
@@ -3351,10 +3217,21 @@ public:
      */
     template<typename T>
     bool set(const std::string& json_path, const T& value) {
+        internal::DeferredCallbacks diagnostics;
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!LIVETUNER_ENABLE_RUNTIME) return false;
         
         try {
-            set_value_by_path(json_, json_path, value);
+            if (json_path.size() > internal::max_key_bytes ||
+                static_cast<size_t>(std::count(json_path.begin(), json_path.end(), '.')) >= internal::max_config_depth)
+                throw std::length_error("JSON path exceeds limits");
+            json candidate = json_;
+            set_value_by_path(candidate, json_path, value);
+            size_t entries = 0;
+            if (!within_limits(candidate, 0, entries) || !internal::json_within_limits(candidate.dump()))
+                throw std::length_error("JSON value exceeds limits");
+            json_.swap(candidate);
+            last_error_ = {};
             return true;
         } catch (const std::exception& e) {
             handle_error(ErrorType::ParseError, 
@@ -3383,40 +3260,52 @@ private:
      * @brief Load JSON file
      */
     bool load() {
+        internal::DeferredCallbacks diagnostics;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!LIVETUNER_ENABLE_RUNTIME) {
+            handle_error(ErrorType::Disabled, "Runtime tuning is disabled");
+            return false;
+        }
         try {
-            std::ifstream file(file_path_);
-            if (!file) {
-                handle_error(ErrorType::FileNotFound, 
-                           "File not found: " + file_path_);
-                return false;
-            }
-            
-            std::lock_guard<std::mutex> lock(mutex_);
-            
-            // Empty file check
-            file.seekg(0, std::ios::end);
-            if (file.tellg() == 0) {
-                json_ = json::object();  // Initialize as empty object
+            ErrorInfo error;
+            auto content = internal::read_file_with_retry(file_path_, {}, &error);
+            if (!content && error.type == ErrorType::FileEmpty) {
+                json_ = json::object();
+                last_error_ = {};
                 return true;
             }
-            file.seekg(0, std::ios::beg);
-            
-            // JSON parse
-            try {
-                file >> json_;
-            } catch (const json::parse_error& e) {
-                handle_error(ErrorType::ParseError, 
-                           "JSON parse error: " + std::string(e.what()));
+            if (!content) {
+                handle_error(error.type, error.message);
                 return false;
             }
-            
+            if (!internal::json_within_limits(*content))
+                throw std::length_error("JSON input exceeds limits");
+            json candidate = json::parse(*content);
+            size_t entries = 0;
+            if (!within_limits(candidate, 0, entries))
+                throw std::length_error("JSON value exceeds limits");
+            json_.swap(candidate);
+            last_error_ = {};
             return true;
             
         } catch (const std::exception& e) {
-            handle_error(ErrorType::FileReadError, 
+            handle_error(ErrorType::ParseError,
                         "Failed to read file: " + std::string(e.what()));
             return false;
         }
+    }
+
+    static bool within_limits(const json& value, size_t depth, size_t& entries) {
+        if (++entries > internal::max_config_entries || depth > internal::max_config_depth) return false;
+        if (value.is_number_float() && !std::isfinite(value.get<double>())) return false;
+        if (value.is_string() && value.get_ref<const std::string&>().size() > internal::max_value_bytes) return false;
+        if (value.is_structured()) {
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (value.is_object() && it.key().size() > internal::max_key_bytes) return false;
+                if (!within_limits(it.value(), depth + 1, entries)) return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -3488,8 +3377,10 @@ private:
         std::vector<std::string> tokens;
         
         while (std::getline(path_stream, token, '.')) {
+            if (token.empty()) throw std::invalid_argument("Empty JSON path component");
             tokens.push_back(token);
         }
+        if (tokens.empty() || path.back() == '.') throw std::invalid_argument("Invalid JSON path");
         
         for (size_t i = 0; i < tokens.size() - 1; ++i) {
             const auto& tok = tokens[i];
@@ -3519,7 +3410,14 @@ private:
         last_error_ = ErrorInfo(type, message, file_path_);
         
         if (error_callback_) {
-            error_callback_(last_error_);
+            internal::DeferredCallbacks::dispatch([callback = error_callback_, error = last_error_] {
+                static thread_local bool delivering = false;
+                if (delivering) return;
+                delivering = true;
+                try { callback(error); }
+                catch (...) { delivering = false; throw; }
+                delivering = false;
+            });
         }
     }
 
@@ -3648,7 +3546,7 @@ private:
 // IMPLEMENTATION SECTION
 // ============================================================================
 // Define LIVETUNER_IMPLEMENTATION in ONE source file before including.
-// Without it, FileWatcher uses polling mode only.
+// Exactly one translation unit must provide the implementation.
 // ============================================================================
 
 #ifdef LIVETUNER_IMPLEMENTATION
@@ -3711,6 +3609,17 @@ private:
 #include <CoreServices/CoreServices.h>
 #endif
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+// Platform-header warnings must not suppress warnings in our implementation.
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
 namespace livetuner {
 namespace internal {
 
@@ -3747,7 +3656,7 @@ inline UniqueInvalidHandle make_unique_invalid_handle(HANDLE h) {
 }
 #endif // _WIN32
 
-#ifdef __linux__
+#ifndef _WIN32
 class UniqueFd {
 public:
     UniqueFd() : fd_(-1) {}
@@ -3789,7 +3698,97 @@ public:
 private:
     int fd_;
 };
-#endif // __linux__
+#endif // !_WIN32
+
+FileReadResult read_regular_file(const std::filesystem::path& path) {
+    const auto failed = [&](ErrorType type, const char* message) {
+        return FileReadResult{std::nullopt, ErrorInfo(type, message, path.string())};
+    };
+#ifdef _WIN32
+    auto file = make_unique_invalid_handle(CreateFileW(path.wstring().c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE)
+        return failed(GetLastError() == ERROR_FILE_NOT_FOUND ? ErrorType::FileNotFound : ErrorType::FileAccessDenied,
+                      "Cannot open configuration file");
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (GetFileType(file.get()) != FILE_TYPE_DISK || !GetFileInformationByHandle(file.get(), &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
+        return failed(ErrorType::InvalidFormat, "Configuration must be a regular non-link file");
+    if (info.nFileSizeHigh != 0 || info.nFileSizeLow > max_config_bytes)
+        return failed(ErrorType::InvalidFormat, "Configuration exceeds byte limit");
+#else
+    UniqueFd file(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    if (!file) return failed(errno == ENOENT ? ErrorType::FileNotFound : ErrorType::FileAccessDenied,
+                             "Cannot open configuration file");
+    struct stat info{};
+    if (fstat(file.get(), &info) != 0 || !S_ISREG(info.st_mode))
+        return failed(ErrorType::InvalidFormat, "Configuration must be a regular non-link file");
+    if (info.st_size < 0 || static_cast<uintmax_t>(info.st_size) > max_config_bytes)
+        return failed(ErrorType::InvalidFormat, "Configuration exceeds byte limit");
+#endif
+    std::string content;
+    std::array<char, 4096> buffer{};
+    for (;;) {
+        // Read at most one byte past the limit, never relying on the initial size.
+        const auto capacity = std::min(buffer.size(), max_config_bytes - content.size() + 1);
+#ifdef _WIN32
+        DWORD count = 0;
+        if (!ReadFile(file.get(), buffer.data(), static_cast<DWORD>(capacity), &count, nullptr))
+            return failed(ErrorType::FileReadError, "Configuration read failed");
+#else
+        const auto count = read(file.get(), buffer.data(), capacity);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return failed(ErrorType::FileReadError, "Configuration read failed");
+        }
+#endif
+        if (count == 0) break;
+        if (static_cast<size_t>(count) > max_config_bytes - content.size())
+            return failed(ErrorType::InvalidFormat, "Configuration exceeds byte limit");
+        content.append(buffer.data(), static_cast<size_t>(count));
+    }
+    if (content.empty()) return failed(ErrorType::FileEmpty, "Configuration is empty");
+    return FileReadResult{std::move(content), {}};
+}
+
+bool write_regular_file(const std::filesystem::path& path, const std::string& content, ErrorInfo& error) {
+    auto failed = [&](const char* message) {
+        error = ErrorInfo(ErrorType::FileAccessDenied, message, path.string());
+        return false;
+    };
+    if (content.size() > max_config_bytes) return failed("Configuration exceeds byte limit");
+#ifdef _WIN32
+    auto file = make_unique_invalid_handle(CreateFileW(path.wstring().c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE) return failed("Cannot open existing configuration for writing");
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (GetFileType(file.get()) != FILE_TYPE_DISK || !GetFileInformationByHandle(file.get(), &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) || info.nNumberOfLinks != 1)
+        return failed("Refusing to write a non-regular or linked file");
+    // Validate the opened handle before truncation, never a separately checked pathname.
+    if (!SetEndOfFile(file.get())) return failed("Cannot truncate configuration");
+    DWORD count = 0;
+    if (!WriteFile(file.get(), content.data(), static_cast<DWORD>(content.size()), &count, nullptr) || count != content.size())
+        return failed("Configuration write failed");
+#else
+    UniqueFd file(open(path.c_str(), O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    if (!file) return failed("Cannot open existing configuration for writing");
+    struct stat info{};
+    if (fstat(file.get(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_nlink != 1)
+        return failed("Refusing to write a non-regular or linked file");
+    if (ftruncate(file.get(), 0) != 0) return failed("Cannot truncate configuration");
+    size_t offset = 0;
+    while (offset < content.size()) {
+        auto count = write(file.get(), content.data() + offset, content.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return failed("Configuration write failed");
+        offset += static_cast<size_t>(count);
+    }
+#endif
+    error = ErrorInfo{};
+    return true;
+}
 
 // ============================================================
 // FileWatcher Implementation (PIMPL)
@@ -3818,53 +3817,25 @@ struct FileWatcher::Impl {
 };
 
 // Constructor
-inline FileWatcher::FileWatcher() : impl_(std::make_unique<Impl>()) {}
+FileWatcher::FileWatcher() : impl_(std::make_unique<Impl>()) {}
 
-inline FileWatcher::FileWatcher(const FileWatcherConfig& config)
+FileWatcher::FileWatcher(const FileWatcherConfig& config)
     : impl_(std::make_unique<Impl>()), config_(config) {
     config_.validate();
 }
 
-inline FileWatcher::~FileWatcher() {
+FileWatcher::~FileWatcher() {
     stop();
 }
 
-inline FileWatcher::FileWatcher(FileWatcher&& other) noexcept
-    : impl_(std::move(other.impl_))
-    , file_path_(std::move(other.file_path_))
-    , callback_(std::move(other.callback_))
-    , running_(other.running_.load())
-    , change_detected_(other.change_detected_.load())
-    , watcher_thread_(std::move(other.watcher_thread_))
-    , config_(std::move(other.config_)) {
-    other.running_.store(false);
-    other.change_detected_.store(false);
-}
-
-inline FileWatcher& FileWatcher::operator=(FileWatcher&& other) noexcept {
-    if (this != &other) {
-        stop();
-        impl_ = std::move(other.impl_);
-        file_path_ = std::move(other.file_path_);
-        callback_ = std::move(other.callback_);
-        running_.store(other.running_.load());
-        change_detected_.store(other.change_detected_.load());
-        watcher_thread_ = std::move(other.watcher_thread_);
-        config_ = std::move(other.config_);
-        other.running_.store(false);
-        other.change_detected_.store(false);
-    }
-    return *this;
-}
-
-inline void FileWatcher::set_config(const FileWatcherConfig& config) {
+void FileWatcher::set_config(const FileWatcherConfig& config) {
     if (!running_.load()) {
         config_ = config;
         config_.validate();
     }
 }
 
-inline bool FileWatcher::start(const std::filesystem::path& file_path, ChangeCallback callback) {
+bool FileWatcher::start(const std::filesystem::path& file_path, ChangeCallback callback) {
     if (running_.load()) {
         stop();
     }
@@ -3873,10 +3844,12 @@ inline bool FileWatcher::start(const std::filesystem::path& file_path, ChangeCal
     callback_ = std::move(callback);
     running_.store(true);
 
-    return start_native();
+    const bool started = start_native();
+    if (!started) stop();
+    return started;
 }
 
-inline void FileWatcher::stop() {
+void FileWatcher::stop() {
     if (!running_.load()) {
         return;
     }
@@ -3888,14 +3861,15 @@ inline void FileWatcher::stop() {
     }
     cv_.notify_all();
 
-    stop_native();
+    signal_native();
 
     if (watcher_thread_.joinable()) {
         watcher_thread_.join();
     }
+    stop_native();
 }
 
-inline bool FileWatcher::wait_for_change(std::chrono::milliseconds timeout) {
+bool FileWatcher::wait_for_change(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(cv_mtx_);
     
     if (change_detected_.load()) {
@@ -3914,7 +3888,7 @@ inline bool FileWatcher::wait_for_change(std::chrono::milliseconds timeout) {
     return false;
 }
 
-inline void FileWatcher::wait_for_change() {
+void FileWatcher::wait_for_change() {
     std::unique_lock<std::mutex> lock(cv_mtx_);
     cv_.wait(lock, [this] {
         return change_detected_.load() || !running_.load();
@@ -3922,11 +3896,11 @@ inline void FileWatcher::wait_for_change() {
     change_detected_.store(false);
 }
 
-inline bool FileWatcher::is_running() const {
+bool FileWatcher::is_running() const {
     return running_.load();
 }
 
-inline bool FileWatcher::has_native_support() {
+bool FileWatcher::has_native_support() {
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     return true;
 #else
@@ -3934,7 +3908,7 @@ inline bool FileWatcher::has_native_support() {
 #endif
 }
 
-inline void FileWatcher::notify_change() {
+void FileWatcher::notify_change() {
     {
         std::lock_guard<std::mutex> lock(cv_mtx_);
         change_detected_.store(true);
@@ -3946,12 +3920,12 @@ inline void FileWatcher::notify_change() {
     }
 }
 
-inline bool FileWatcher::start_polling() {
+bool FileWatcher::start_polling() {
     watcher_thread_ = std::thread([this] { watch_polling(); });
     return true;
 }
 
-inline void FileWatcher::watch_polling() {
+void FileWatcher::watch_polling() {
     auto last_modify_time = std::filesystem::file_time_type::min();
     
     std::chrono::milliseconds poll_interval{50};
@@ -3987,7 +3961,7 @@ inline void FileWatcher::watch_polling() {
 // ============================================================
 
 #ifdef _WIN32
-inline bool FileWatcher::start_native() {
+bool FileWatcher::start_native() {
     impl_->current_buffer_size.store(config_.buffer_size);
     
     auto dir_path = file_path_.parent_path();
@@ -4017,17 +3991,21 @@ inline bool FileWatcher::start_native() {
     impl_->dir_handle = std::move(dir_handle);
     impl_->stop_event = std::move(stop_event);
 
-    watcher_thread_ = std::thread([this] {
+    auto ready = std::make_shared<std::promise<bool>>();
+    auto ready_result = ready->get_future();
+    watcher_thread_ = std::thread([this, ready] {
         size_t buffer_size = impl_->current_buffer_size.load();
         std::vector<BYTE> buffer(buffer_size);
         OVERLAPPED overlapped{};
         auto overlapped_event = make_unique_handle(CreateEvent(nullptr, TRUE, FALSE, nullptr));
         if (!overlapped_event) {
+            ready->set_value(false);
             return;
         }
         overlapped.hEvent = overlapped_event.get();
 
         auto filename = file_path_.filename().wstring();
+        bool first_request = true;
 
         while (running_.load()) {
             ResetEvent(overlapped.hEvent);
@@ -4037,11 +4015,16 @@ inline bool FileWatcher::start_native() {
                 buffer.data(),
                 static_cast<DWORD>(buffer.size()),
                 FALSE,
-                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_FILE_NAME,
                 nullptr,
                 &overlapped,
                 nullptr
             );
+            if (first_request) {
+                first_request = false;
+                ready->set_value(result != FALSE);
+                if (!result) return;
+            }
 
             if (!result) {
                 DWORD error = GetLastError();
@@ -4057,7 +4040,9 @@ inline bool FileWatcher::start_native() {
                                 if (config_.on_buffer_overflow) {
                                     config_.on_buffer_overflow(current_size, new_size);
                                 }
-                            } catch (...) {}
+                            } catch (const std::exception& e) {
+                                log(LogLevel::Error, std::string("Watcher overflow handling failed: ") + e.what());
+                            }
                         }
                     }
                     continue;
@@ -4090,26 +4075,31 @@ inline bool FileWatcher::start_native() {
                     } while (true);
                 }
             } else {
+                // The OVERLAPPED and buffer must survive cancellation completion.
+                CancelIoEx(impl_->dir_handle.get(), &overlapped);
+                DWORD ignored = 0;
+                GetOverlappedResult(impl_->dir_handle.get(), &overlapped, &ignored, TRUE);
                 break;
             }
         }
     });
-    return true;
+    // start() must not return before the first watch request is armed.
+    return ready_result.get();
 }
 
-inline void FileWatcher::stop_native() {
+void FileWatcher::signal_native() {
     if (impl_->stop_event) {
         SetEvent(impl_->stop_event.get());
     }
-    if (impl_->dir_handle) {
-        CancelIo(impl_->dir_handle.get());
-    }
+}
+
+void FileWatcher::stop_native() {
     impl_->dir_handle.reset();
     impl_->stop_event.reset();
 }
 
 #elif defined(__linux__)
-inline bool FileWatcher::start_native() {
+bool FileWatcher::start_native() {
     UniqueFd inotify_fd(inotify_init1(IN_NONBLOCK));
     if (!inotify_fd) {
         return start_polling();
@@ -4179,6 +4169,7 @@ inline bool FileWatcher::start_native() {
                     while (i < static_cast<size_t>(len)) {
                         const auto* event = reinterpret_cast<const struct inotify_event*>(buffer.data() + i);
                         
+                        if (event->mask & IN_Q_OVERFLOW) should_notify = true;
                         if (event->len > 0) {
                             std::string event_name(event->name);
                             
@@ -4206,11 +4197,14 @@ inline bool FileWatcher::start_native() {
     return true;
 }
 
-inline void FileWatcher::stop_native() {
+void FileWatcher::signal_native() {
     if (impl_->pipe_write_fd) {
         char c = 'x';
         [[maybe_unused]] auto _ = write(impl_->pipe_write_fd.get(), &c, 1);
     }
+}
+
+void FileWatcher::stop_native() {
     if (impl_->dir_watch_fd >= 0 && impl_->inotify_fd) {
         inotify_rm_watch(impl_->inotify_fd.get(), impl_->dir_watch_fd);
         impl_->dir_watch_fd = -1;
@@ -4244,7 +4238,7 @@ namespace {
     }
 }
 
-inline bool FileWatcher::start_native() {
+bool FileWatcher::start_native() {
     auto dir_path = file_path_.parent_path();
     if (dir_path.empty()) {
         dir_path = ".";
@@ -4290,10 +4284,17 @@ inline bool FileWatcher::start_native() {
     return true;
 }
 
-inline void FileWatcher::stop_native() {
+void FileWatcher::signal_native() {
     if (impl_->stream) {
         FSEventStreamStop(impl_->stream);
         FSEventStreamInvalidate(impl_->stream);
+        // Invalidation prevents new delivery; drain already queued callbacks.
+        if (impl_->queue) dispatch_sync_f(impl_->queue, nullptr, [](void*) {});
+    }
+}
+
+void FileWatcher::stop_native() {
+    if (impl_->stream) {
         FSEventStreamRelease(impl_->stream);
         impl_->stream = nullptr;
     }
@@ -4305,13 +4306,14 @@ inline void FileWatcher::stop_native() {
 
 #else
 // Fallback: polling only
-inline bool FileWatcher::start_native() {
+bool FileWatcher::start_native() {
     return start_polling();
 }
 
-inline void FileWatcher::stop_native() {
+void FileWatcher::stop_native() {
     // Nothing to do for polling mode
 }
+void FileWatcher::signal_native() {}
 #endif
 
 } // namespace internal
@@ -4322,11 +4324,11 @@ inline void FileWatcher::stop_native() {
 // These must be defined here because they use unique_ptr<FileWatcher>
 // which requires complete type of FileWatcher::Impl
 
-inline Params::~Params() {
+Params::~Params() {
     stop_watching();
 }
 
-inline Params::Params(Params&& other) noexcept
+Params::Params(Params&& other) noexcept
     : mtx_()
     , file_path_(std::move(other.file_path_))
     , format_(other.format_)
@@ -4337,17 +4339,17 @@ inline Params::Params(Params&& other) noexcept
     , file_watcher_config_(std::move(other.file_watcher_config_))
     , file_read_retry_config_(std::move(other.file_read_retry_config_))
     , use_event_driven_(other.use_event_driven_)
-    , file_changed_(other.file_changed_.load())
+    , file_changed_(std::move(other.file_changed_))
     , last_error_(std::move(other.last_error_))
     , on_change_callback_(std::move(other.on_change_callback_))
     , in_callback_(other.in_callback_.load())
 {
 }
 
-inline Params& Params::operator=(Params&& other) noexcept {
+Params& Params::operator=(Params&& other) noexcept {
     if (this != &other) {
         stop_watching();
-        std::lock_guard<std::mutex> lock(mtx_);
+        std::scoped_lock lock(mtx_, other.mtx_);
         file_path_ = std::move(other.file_path_);
         format_ = other.format_;
         file_cache_ = std::move(other.file_cache_);
@@ -4357,7 +4359,7 @@ inline Params& Params::operator=(Params&& other) noexcept {
         file_watcher_config_ = std::move(other.file_watcher_config_);
         file_read_retry_config_ = std::move(other.file_read_retry_config_);
         use_event_driven_ = other.use_event_driven_;
-        file_changed_.store(other.file_changed_.load());
+        file_changed_ = std::move(other.file_changed_);
         last_error_ = std::move(other.last_error_);
         on_change_callback_ = std::move(other.on_change_callback_);
         in_callback_.store(other.in_callback_.load());
@@ -4365,43 +4367,39 @@ inline Params& Params::operator=(Params&& other) noexcept {
     return *this;
 }
 
-inline LiveTuner::~LiveTuner() {
-    if (file_watcher_) {
-        file_watcher_->stop();
-    }
+LiveTuner::~LiveTuner() {
+    stop_async();
 }
 
-inline LiveTuner::LiveTuner(LiveTuner&& other) noexcept
+LiveTuner::LiveTuner(LiveTuner&& other) noexcept
     : mtx_()
     , input_file_path_(std::move(other.input_file_path_))
     , file_cache_(std::move(other.file_cache_))
-    , file_watcher_(std::move(other.file_watcher_))
     , file_watcher_config_(std::move(other.file_watcher_config_))
     , file_read_retry_config_(std::move(other.file_read_retry_config_))
     , use_event_driven_(other.use_event_driven_)
     , last_error_(std::move(other.last_error_))
+    , async_tasks_(std::move(other.async_tasks_))
 {
 }
 
-inline LiveTuner& LiveTuner::operator=(LiveTuner&& other) noexcept {
+LiveTuner& LiveTuner::operator=(LiveTuner&& other) noexcept {
     if (this != &other) {
-        if (file_watcher_) {
-            file_watcher_->stop();
-        }
-        std::lock_guard<std::mutex> lock(mtx_);
+        stop_async();
+        std::scoped_lock lock(mtx_, other.mtx_);
         input_file_path_ = std::move(other.input_file_path_);
         file_cache_ = std::move(other.file_cache_);
-        file_watcher_ = std::move(other.file_watcher_);
         file_watcher_config_ = std::move(other.file_watcher_config_);
         file_read_retry_config_ = std::move(other.file_read_retry_config_);
         use_event_driven_ = other.use_event_driven_;
         last_error_ = std::move(other.last_error_);
+        async_tasks_ = std::move(other.async_tasks_);
     }
     return *this;
 }
 
 #ifdef LIVETUNER_USE_NLOHMANN_JSON
-inline NlohmannParams::~NlohmannParams() {
+NlohmannParams::~NlohmannParams() {
     if (watcher_) {
         watcher_->stop();
     }
@@ -4409,10 +4407,5 @@ inline NlohmannParams::~NlohmannParams() {
 #endif // LIVETUNER_USE_NLOHMANN_JSON
 
 } // namespace livetuner
-
-// Restore MSVC warning level
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
 
 #endif // LIVETUNER_IMPLEMENTATION

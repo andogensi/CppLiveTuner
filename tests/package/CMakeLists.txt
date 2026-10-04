@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(LiveTunerPackageConsumer LANGUAGES CXX)
+find_package(LiveTuner CONFIG REQUIRED)
+add_executable(consumer ../multi_tu_impl.cpp ../multi_tu_main.cpp)
+target_link_libraries(consumer PRIVATE LiveTuner::LiveTuner)
+enable_testing()
+add_test(NAME installed_package COMMAND consumer)
+set_tests_properties(installed_package PROPERTIES TIMEOUT 30)

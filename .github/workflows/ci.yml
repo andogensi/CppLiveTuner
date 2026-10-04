@@ -2,71 +2,139 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [main, master, develop]
   pull_request:
-    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-linux:
-    runs-on: ubuntu-latest
+  build:
+    name: ${{ matrix.platform.os }} / ${{ matrix.platform.compiler }} / ${{ matrix.config }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
-        compiler: [g++, clang++]
-    
+        config: [Debug, Release]
+        platform:
+          - {os: ubuntu-24.04, compiler: g++}
+          - {os: ubuntu-24.04, compiler: clang++}
+          - {os: windows-latest, compiler: MSVC}
+          - {os: macos-14, compiler: clang++}
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Build with ${{ matrix.compiler }}
-      run: |
-        ${{ matrix.compiler }} --version
-        ${{ matrix.compiler }} -std=c++17 -Wall -Wextra -Werror -I. test_compile.cpp -o test_compile -pthread
-    
-    - name: Run tests
-      run: ./test_compile
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Configure
+        shell: bash
+        run: |
+          args=()
+          if [[ '${{ matrix.platform.compiler }}' != 'MSVC' ]]; then
+            args+=("-DCMAKE_CXX_COMPILER=${{ matrix.platform.compiler }}")
+          fi
+          cmake -S . -B build "${args[@]}" -DCMAKE_BUILD_TYPE=${{ matrix.config }} \
+            -DLIVETUNER_BUILD_TESTS=ON -DLIVETUNER_BUILD_EXAMPLES=ON -DLIVETUNER_TEST_OPTIONAL_BACKENDS=ON
+      - name: Build (warnings are errors)
+        run: cmake --build build --config ${{ matrix.config }} --parallel 2
+      - name: Run regression tests
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --no-tests=error --parallel 2
+      - name: Install
+        run: cmake --install build --config ${{ matrix.config }} --prefix "${{ github.workspace }}/install"
+      - name: Configure installed consumer
+        run: cmake -S tests/package -B package-build -DCMAKE_BUILD_TYPE=${{ matrix.config }} -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install"
+      - name: Build installed consumer
+        run: cmake --build package-build --config ${{ matrix.config }} --parallel 2
+      - name: Test installed consumer
+        run: ctest --test-dir package-build -C ${{ matrix.config }} --output-on-failure --no-tests=error
+      - name: Retain failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-logs-${{ matrix.platform.os }}-${{ matrix.platform.compiler }}-${{ matrix.config }}
+          path: |
+            build/Testing/Temporary/
+            package-build/Testing/Temporary/
+          if-no-files-found: warn
 
-  build-windows:
-    runs-on: windows-latest
-    
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup MSVC
-      uses: microsoft/setup-msbuild@v2
-    
-    - name: Build with MSVC
-      shell: cmd
-      run: |
-        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        cl /std:c++17 /W4 /WX /EHsc /I. test_compile.cpp /Fe:test_compile.exe
-    
-    - name: Run tests
-      run: .\test_compile.exe
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Reserve a compatible TSan shadow address range
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=g++ -DLIVETUNER_BUILD_TESTS=ON -DLIVETUNER_TEST_OPTIONAL_BACKENDS=ON -DLIVETUNER_SANITIZER=${{ matrix.sanitizer }}
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Run instrumented tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build --output-on-failure --no-tests=error --parallel 2
+      - name: Retain sanitizer diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sanitizer-${{ matrix.sanitizer }}
+          path: build/Testing/Temporary/
+          if-no-files-found: warn
 
-  build-macos:
-    runs-on: macos-latest
-    
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Build with clang++
-      run: |
-        clang++ --version
-        clang++ -std=c++17 -Wall -Wextra -Werror -I. test_compile.cpp -o test_compile -framework CoreServices
-    
-    - name: Run tests
-      run: ./test_compile
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug -DLIVETUNER_BUILD_FUZZER=ON
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Fuzz bounded parsers
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build/livetuner_fuzz tests/fuzz_corpus -max_total_time=45 -timeout=3 -rss_limit_mb=512 -max_len=1048577
 
-  cmake-build:
-    runs-on: ubuntu-latest
-    
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Configure CMake
-      run: cmake -B build -DLIVETUNER_BUILD_EXAMPLES=ON -DLIVETUNER_BUILD_TESTS=ON
-    
-    - name: Build
-      run: cmake --build build
-    
-    - name: Run CTest
-      run: ctest --test-dir build --output-on-failure
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Reject CI failure suppression and mutable action references
+        run: python3 tests/check_ci_policy.py
+
+  required:
+    name: Required CI
+    if: always()
+    needs: [build, sanitizers, fuzz, policy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          BUILD: ${{ needs.build.result }}
+          SANITIZERS: ${{ needs.sanitizers.result }}
+          FUZZ: ${{ needs.fuzz.result }}
+          POLICY: ${{ needs.policy.result }}
+        run: |
+          test "$BUILD" = success
+          test "$SANITIZERS" = success
+          test "$FUZZ" = success
+          test "$POLICY" = success

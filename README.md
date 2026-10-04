@@ -16,6 +16,9 @@
 
 </div>
 
+Security hardening changes file creation and asynchronous lifetime behavior. Read the
+[security and migration guide](docs/SECURITY_AND_MIGRATION.md) before upgrading or enabling tuning in production.
+
 ---
 
 > **📋 STB-style Single Header Library**  

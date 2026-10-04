@@ -28,7 +28,7 @@ jobs:
           - {os: windows-latest, compiler: MSVC}
           - {os: macos-14, compiler: clang++}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Configure
@@ -54,12 +54,13 @@ jobs:
         run: ctest --test-dir package-build -C ${{ matrix.config }} --output-on-failure --no-tests=error
       - name: Retain failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-logs-${{ matrix.platform.os }}-${{ matrix.platform.compiler }}-${{ matrix.config }}
           path: |
             build/Testing/Temporary/
             package-build/Testing/Temporary/
+            build/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: warn
 
   sanitizers:
@@ -70,7 +71,7 @@ jobs:
       matrix:
         sanitizer: [address, thread]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Reserve a compatible TSan shadow address range
@@ -88,17 +89,19 @@ jobs:
         run: ctest --test-dir build --output-on-failure --no-tests=error --parallel 2
       - name: Retain sanitizer diagnostics
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sanitizer-${{ matrix.sanitizer }}
-          path: build/Testing/Temporary/
+          path: |
+            build/Testing/Temporary/
+            build/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: warn
 
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Configure
@@ -114,7 +117,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Reject CI failure suppression and mutable action references

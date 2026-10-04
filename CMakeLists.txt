@@ -63,8 +63,8 @@ if(LIVETUNER_TEST_OPTIONAL_BACKENDS)
         URL https://codeload.github.com/nlohmann/json/tar.gz/refs/tags/v3.12.0
         URL_HASH SHA256=4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187)
     FetchContent_Declare(picojson
-        URL https://codeload.github.com/kazuho/picojson/tar.gz/25fc213cca61ea22b3c2e4db8def9927562ba5f7
-        URL_HASH SHA256=37ab329d95fea494cd61d05c83f3cc3ceac582ebc6a9f6cc8ae0676b4633ee0a)
+        URL https://codeload.github.com/kazuho/picojson/tar.gz/111c9be5188f7350c2eac9ddaedd8cca3d7bf394
+        URL_HASH SHA256=671f89832a17e9e71398f80c0a326afa2ebe81f4c26d5a9992e1fcd0888ae151)
     FetchContent_MakeAvailable(nlohmann_json picojson)
 endif()
 

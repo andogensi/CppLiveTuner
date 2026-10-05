@@ -32,13 +32,91 @@ static void write_file(const fs::path& path, const std::string& text) {
     file.exceptions(std::ios::failbit | std::ios::badbit);
     file << text;
     file.close();
-    // Ensure changed metadata even on filesystems with coarse clock resolution.
-    static std::atomic<int> tick{0};
-    fs::last_write_time(path, fs::file_time_type::clock::now() + std::chrono::seconds(++tick));
 }
 
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+static void missing_file_regressions() {
+    int logs = 0;
+    livetuner::set_log_callback([&](livetuner::LogLevel, const std::string&) { ++logs; });
+    livetuner::Params params("not-created.json");
+    int named = 7, plain = 9;
+    params.bind("x", named, 7);
+    livetuner::tune_init("not-created.txt");
+    auto started = std::chrono::steady_clock::now();
+    for (int i = 0; i < 30; ++i) require(!params.update(), "missing Params file reported an update");
+    const auto params_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    started = std::chrono::steady_clock::now();
+    for (int i = 0; i < 30; ++i) require(!livetuner::tune_try(plain), "missing plain file reported an update");
+    const auto tuner_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    std::cout << "30 missing reads: Params=" << params_ms.count() << "ms, tune_try=" << tuner_ms.count() << "ms, logs=" << logs << '\n';
+    require(params_ms < 500ms && tuner_ms < 500ms, "non-blocking API slept while reading a missing file");
+    require(logs == 2, "unchanged missing-file errors were logged repeatedly");
+    require(named == 7 && plain == 9 && !fs::exists("not-created.json") && !fs::exists("not-created.txt"), "missing read changed defaults or created a file");
+
+    // Retry configuration must never add sleeps to an update/try_get call.
+    livetuner::FileReadRetryConfig retry;
+    retry.retry_delay = 250ms;
+    params.set_read_retry_config(retry);
+    livetuner::get_default_tuner().set_read_retry_config(retry);
+    params.invalidate_cache();
+    livetuner::get_default_tuner().invalidate_cache();
+    started = std::chrono::steady_clock::now();
+    params.update();
+    livetuner::tune_try(plain);
+    require(std::chrono::steady_clock::now() - started < 500ms, "polling used the blocking retry policy");
+    require(logs == 2, "cache invalidation re-logged an unchanged error");
+
+    write_file("not-created.json", "{\"x\":11}");
+    write_file("not-created.txt", "13\n");
+    require(params.update() && livetuner::tune_try(plain) && named == 11 && plain == 13, "negative cache hid a newly created file");
+    write_file("empty.json", "");
+    params.set_file("empty.json");
+    started = std::chrono::steady_clock::now();
+    require(!params.update(), "empty configuration accepted");
+    require(std::chrono::steady_clock::now() - started < 500ms, "empty-file read slept");
+    livetuner::get_default_tuner().set_read_retry_config({});
+    livetuner::tune_reset();
+    livetuner::set_log_callback(nullptr);
+}
+
+static void timestamp_regressions() {
+    // No advancing clock helper: use actual rapid writes, then force equal mtimes
+    // to exercise coarse timestamp resolution deterministically on every OS.
+    for (const bool same_time : {false, true}) {
+        for (int trial = 0; trial < 50; ++trial) {
+            write_file("rapid.json", "{\"x\":1}");
+            write_file("rapid.txt", "1\n");
+            livetuner::Params params("rapid.json");
+            livetuner::LiveTuner tuner("rapid.txt");
+            int named = 0, plain = 0;
+            params.bind("x", named);
+            require(params.update() && tuner.try_get(plain) && named == 1 && plain == 1, "rapid-write control failed");
+            const auto json_time = fs::last_write_time("rapid.json");
+            const auto text_time = fs::last_write_time("rapid.txt");
+            for (const int value : {2, 3}) {
+                // Bypass write_file entirely, so this test cannot inherit fake mtimes.
+                { std::ofstream file("rapid.json"); file << "{\"x\":" << value << '}'; }
+                { std::ofstream file("rapid.txt"); file << value << '\n'; }
+                if (same_time) {
+                    fs::last_write_time("rapid.json", json_time);
+                    fs::last_write_time("rapid.txt", text_time);
+                }
+                params.update();
+                tuner.try_get(plain);
+            }
+            const auto deadline = std::chrono::steady_clock::now() + 500ms;
+            while ((named != 3 || plain != 3) && std::chrono::steady_clock::now() < deadline) {
+                params.update();
+                tuner.try_get(plain);
+                std::this_thread::sleep_for(1ms);
+            }
+            require(named == 3 && plain == 3, "final rapid write remained stale without another save");
+        }
+        std::cout << (same_time ? "Equal-mtime" : "Native-mtime") << " writes: 50/50 final values observed\n";
+    }
 }
 
 static void parser_regressions() {
@@ -85,18 +163,28 @@ static void ingress_regressions() {
     livetuner::Params params("params.json");
     params.bind("speed", speed);
     params.bind("count", count);
-    require(params.update() && speed == 12 && count == 3, "Params normal read failed");
+    // Ingress assertions inspect a completed probe, not the short polling cache.
+    // Actual rapid/equal-mtime writes are covered separately by timestamps.
+    const auto refresh = [&] {
+        std::this_thread::sleep_for(livetuner::Params::FileCache::cache_duration + 1ms);
+        return params.update();
+    };
+    require(refresh() && speed == 12 && count == 3, "Params normal read failed");
     write_file("params.json", R"({"speed":99,"count":"invalid"})");
-    require(!params.update() && params.has_error(), "invalid binding reported success");
+    require(!refresh() && params.has_error(), "invalid binding reported success");
     require(speed == 12 && count == 3 && params.get<int>("speed") == 12, "last good snapshot was partially overwritten");
     write_file("params.json", R"({"speed":1e309})");
-    require(!params.update() && speed == 12, "numeric overflow corrupted bindings");
+    require(!refresh() && speed == 12, "numeric overflow corrupted bindings");
     write_file("params.json", std::string(livetuner::internal::max_config_bytes + 1, 'x'));
-    require(!params.update() && speed == 12, "oversized file accepted");
+    require(!refresh() && speed == 12, "oversized file accepted");
     write_file("params.json", R"({"speed":15,"count":4})");
-    require(params.update() && speed == 15, "recovery after invalid input failed");
+    require(refresh() && speed == 15, "recovery after invalid input failed");
     std::this_thread::sleep_for(20ms);
     require(!params.update(), "unchanged snapshot reparsed as update");
+    write_file("params.json", "broken");
+    require(!refresh() && params.has_error(), "invalid snapshot had no error");
+    write_file("params.json", R"({"speed":15,"count":4})");
+    require(!refresh() && !params.has_error() && speed == 15, "restoring the same good snapshot did not clear the error");
 
     livetuner::Params missing("missing.json");
     require(!missing.update() && !fs::exists("missing.json"), "read API created a file");
@@ -313,6 +401,8 @@ int main(int argc, char** argv) {
         else if (group == "lifetime") lifetime_regressions();
         else if (group == "watcher") watcher_regressions();
         else if (group == "concurrency") concurrency_regressions();
+        else if (group == "missing") missing_file_regressions();
+        else if (group == "timestamps") timestamp_regressions();
         else require(false, "unknown regression group");
         std::cout << "security regressions passed\n";
         return 0;

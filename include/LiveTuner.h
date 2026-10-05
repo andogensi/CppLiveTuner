@@ -1279,6 +1279,27 @@ struct FileReadResult {
 FileReadResult read_regular_file(const std::filesystem::path& path);
 bool write_regular_file(const std::filesystem::path& path, const std::string& content, ErrorInfo& error);
 
+// Polling APIs perform one bounded read. They never wait for an editor to finish;
+// a later update/try_get call retries, and the caller controls diagnostic delivery.
+inline std::optional<std::string> read_file_once(const std::filesystem::path& path, ErrorInfo& error) {
+    try {
+        auto result = read_regular_file(path);
+        error = std::move(result.error);
+        return std::move(result.content);
+    } catch (const std::exception& e) {
+        error = ErrorInfo(ErrorType::FileReadError, e.what(), path.string());
+    } catch (...) {
+        error = ErrorInfo(ErrorType::FileReadError, "Unknown exception during file read", path.string());
+    }
+    return std::nullopt;
+}
+
+inline void log_changed_error(const ErrorInfo& error, const ErrorInfo& previous) {
+    if (error && (error.type != previous.type || error.message != previous.message ||
+                  error.file_path != previous.file_path))
+        log(LogLevel::Warning, error.to_string());
+}
+
 /**
  * @brief Read file contents with retry logic
  * 
@@ -1815,6 +1836,7 @@ public:
         std::filesystem::file_time_type last_modify_time;
         std::chrono::steady_clock::time_point last_access;
         bool file_exists = false;
+        bool attempted = false;
         static constexpr std::chrono::milliseconds cache_duration{10};
     };
 
@@ -1999,17 +2021,22 @@ public:
             auto now = std::chrono::steady_clock::now();
             auto current_modify_time = internal::get_file_modify_time(file_path_);
             
-            // Cache check
-            if (file_cache_.file_exists && 
+            // Successful and failed probes expire: mtime is only a hint, not a
+            // content identity (editors/filesystems can preserve or coarsen it).
+            if (file_cache_.attempted &&
+                now - file_cache_.last_access < FileCache::cache_duration &&
                 current_modify_time == file_cache_.last_modify_time) {
                 return false;
             }
             
+            const auto previous_error = last_error_;
             updated = load_file();
+            internal::log_changed_error(last_error_, previous_error);
             
             file_cache_.last_modify_time = current_modify_time;
             file_cache_.last_access = now;
             file_cache_.file_exists = !last_error_;
+            file_cache_.attempted = true;
             
             // Copy callback and invoke outside lock (prevent deadlock)
             if (updated && on_change_callback_) {
@@ -2091,6 +2118,7 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             if (!file_changed_ || !file_changed_->exchange(false)) return false;
             file_cache_.file_exists = false;
+            file_cache_.attempted = false;
         }
         return update();
     }
@@ -2245,9 +2273,9 @@ private:
     }
 
     bool load_file() {
-        // Read file with retry logic
+        // update() is a polling API: never use the sleeping retry helper here.
         ErrorInfo read_error;
-        auto content_opt = internal::read_file_with_retry(file_path_, file_read_retry_config_, &read_error);
+        auto content_opt = internal::read_file_once(file_path_, read_error);
         if (!content_opt) {
             last_error_ = read_error;
             return false;
@@ -2264,7 +2292,6 @@ private:
             if (!parsed) {
                 last_error_ = ErrorInfo(ErrorType::ParseError, 
                                        "Failed to parse JSON format", file_path_);
-                internal::log(LogLevel::Error, last_error_.to_string());
             }
             break;
         case FileFormat::Yaml:
@@ -2272,7 +2299,6 @@ private:
             if (!parsed) {
                 last_error_ = ErrorInfo(ErrorType::ParseError, 
                                        "Failed to parse YAML format", file_path_);
-                internal::log(LogLevel::Error, last_error_.to_string());
             }
             break;
         case FileFormat::KeyValue:
@@ -2282,7 +2308,6 @@ private:
             if (!parsed) {
                 last_error_ = ErrorInfo(ErrorType::ParseError, 
                                        "Failed to parse key-value format", file_path_);
-                internal::log(LogLevel::Error, last_error_.to_string());
             }
             break;
         }
@@ -2302,6 +2327,7 @@ private:
         }
         
         if (!any_changed && new_values.size() == current_values_.size()) {
+            last_error_ = {};
             return false;
         }
         
@@ -2311,7 +2337,6 @@ private:
             if (!binding->prepare(it == new_values.end() ? nullptr : &it->second)) {
                 last_error_ = ErrorInfo(ErrorType::ParseError,
                     "Invalid value for parameter '" + name + "'", file_path_);
-                internal::log(LogLevel::Warning, last_error_.to_string());
                 return false;
             }
         }
@@ -2346,6 +2371,7 @@ public:
         std::filesystem::file_time_type last_modify_time{};
         std::chrono::steady_clock::time_point last_access{};
         bool file_exists = false;
+        bool attempted = false;
         static constexpr std::chrono::milliseconds cache_duration{10};
     };
 private:
@@ -2379,8 +2405,10 @@ private:
 
     template<typename T>
     static bool read_value(const ReadConfig& config, T& value, ErrorInfo& error,
-                           const std::atomic<bool>* cancelled = nullptr) {
-        auto content = internal::read_file_with_retry(config.path, config.retry, &error, cancelled);
+                           const std::atomic<bool>* cancelled = nullptr, bool allow_retry = true) {
+        auto content = allow_retry
+            ? internal::read_file_with_retry(config.path, config.retry, &error, cancelled)
+            : internal::read_file_once(config.path, error);
         if (!content) return false;
         try {
             std::istringstream stream(*content);
@@ -2546,11 +2574,14 @@ public:
             return false;
         }
         const auto modified = internal::get_file_modify_time(input_file_path_);
-        if (file_cache_.file_exists && modified == file_cache_.last_modify_time) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (file_cache_.attempted && now - file_cache_.last_access < FileCache::cache_duration &&
+            modified == file_cache_.last_modify_time) return false;
         const ReadConfig config{input_file_path_, file_watcher_config_, file_read_retry_config_, use_event_driven_};
-        const bool read = read_value(config, value, last_error_);
-        file_cache_ = {modified, std::chrono::steady_clock::now(), read};
-        if (!read) internal::log(LogLevel::Warning, last_error_.to_string());
+        const auto previous_error = last_error_;
+        const bool read = read_value(config, value, last_error_, nullptr, false);
+        file_cache_ = {modified, now, read, true};
+        internal::log_changed_error(last_error_, previous_error);
         return read;
     }
 

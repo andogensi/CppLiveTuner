@@ -1922,6 +1922,7 @@ public:
     
     /**
      * @brief Get file read retry configuration
+     * @note Retained for compatibility. update()/poll() always make one attempt.
      */
     internal::FileReadRetryConfig get_read_retry_config() const {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -2366,16 +2367,25 @@ private:
 // ============================================================
 
 /**
- * @brief Live parameter tuning (Low-level API)
- * 
- * @warning Event-driven callbacks run on background thread.
- * Not safe for OpenGL/DirectX. Use Params class for main-thread execution.
+ * @brief Exception delivered by a future when its owner cancels the operation
  */
 class AsyncCancelled : public std::runtime_error {
 public:
     AsyncCancelled() : std::runtime_error("LiveTuner asynchronous read cancelled") {}
 };
 
+/**
+ * @brief Live parameter tuning (low-level, single-value API)
+ *
+ * try_get() performs one read without retry sleeps; get()/get_timeout() and
+ * get_async() wait for valid input using the configured retry policy.
+ * Pending asynchronous work moves with its owner and is cancelled on reset or
+ * destruction. Configuration paths are never created by read operations.
+ *
+ * @warning Asynchronous callbacks execute on a worker thread, not the caller's
+ * thread. Use Params for main-thread callbacks such as OpenGL/DirectX updates.
+ * Do not race object destruction/move with external member calls.
+ */
 class LiveTuner {
 public:
     struct FileCache {
@@ -2523,59 +2533,132 @@ private:
     void invalidate_cache_locked() { file_cache_ = FileCache{}; }
 
 public:
+    /**
+     * @brief Construct a tuner for params.txt in the process working directory
+     */
     LiveTuner() = default;
+
+    /**
+     * @brief Construct a tuner for an existing file, or one supplied later
+     */
     explicit LiveTuner(std::string_view path) : input_file_path_(path) {}
+
     LiveTuner(const LiveTuner&) = delete;
     LiveTuner& operator=(const LiveTuner&) = delete;
     LiveTuner(LiveTuner&&) noexcept;
     LiveTuner& operator=(LiveTuner&&) noexcept;
     ~LiveTuner();
 
+    /**
+     * @brief Get a snapshot of the blocking/asynchronous read retry policy
+     */
     internal::FileReadRetryConfig get_read_retry_config() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return file_read_retry_config_;
     }
+
+    /**
+     * @brief Set retries for future waiting operations; try_get() never sleeps
+     */
     void set_read_retry_config(const internal::FileReadRetryConfig& config) {
         std::lock_guard<std::mutex> lock(mtx_);
         file_read_retry_config_ = config;
     }
+
+    /**
+     * @brief Get a snapshot of the file watcher configuration
+     */
     internal::FileWatcherConfig get_watcher_config() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return file_watcher_config_;
     }
+
+    /**
+     * @brief Configure watchers created by subsequent waiting operations
+     */
     void set_watcher_config(const internal::FileWatcherConfig& config) {
         std::lock_guard<std::mutex> lock(mtx_);
         file_watcher_config_ = config;
         file_watcher_config_.validate();
     }
+
+    /**
+     * @brief Change the file for subsequent reads and invalidate the polling cache
+     * @note Already started asynchronous operations retain their path snapshot.
+     */
     void set_file(std::string_view path) {
         std::lock_guard<std::mutex> lock(mtx_);
         input_file_path_ = path;
         invalidate_cache_locked();
     }
+
+    /**
+     * @brief Get a snapshot of the configured path
+     */
     std::string get_file() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return input_file_path_;
     }
+
+    /**
+     * @brief Enable native notifications for subsequent waiting operations
+     */
     void set_event_driven(bool enabled) {
         std::lock_guard<std::mutex> lock(mtx_);
         use_event_driven_ = enabled;
     }
+
+    /**
+     * @brief Check whether subsequent waits will use native notifications
+     */
     bool is_event_driven() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return use_event_driven_;
     }
-    static bool has_native_file_watch() { return internal::FileWatcher::has_native_support(); }
+
+    /**
+     * @brief Check whether this platform has a native file-watching backend
+     */
+    static bool has_native_file_watch() {
+        return internal::FileWatcher::has_native_support();
+    }
+
+    /**
+     * @brief Get the last synchronous-read error; async futures report their own errors
+     */
     ErrorInfo last_error() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return last_error_;
     }
-    bool has_error() const { return static_cast<bool>(last_error()); }
+
+    /**
+     * @brief Check for a synchronous-read error
+     */
+    bool has_error() const {
+        return static_cast<bool>(last_error());
+    }
+
+    /**
+     * @brief Clear the stored synchronous-read error
+     */
     void clear_error() {
         std::lock_guard<std::mutex> lock(mtx_);
         last_error_ = {};
     }
 
+    /**
+     * @brief Try one bounded read without sleeping or creating a file
+     *
+     * Matching timestamps are cached for at most 10 ms, including failed probes.
+     * After expiry, contents are read again even if mtime did not change. A
+     * successful re-read can therefore return true for an unchanged value.
+     * Identical consecutive errors are logged once and remain in last_error().
+     *
+     * @param value Destination, left unchanged on failure
+     * @return true on a successful read; false for a cache hit or an error
+     * @note Serialized by the instance mutex. OS/file I/O is synchronous, so this
+     * is not a hard real-time guarantee for slow/network/cloud filesystems.
+     */
     template<typename T>
     bool try_get(T& value) {
         internal::DeferredCallbacks diagnostics;
@@ -2596,6 +2679,9 @@ public:
         return read;
     }
 
+    /**
+     * @brief Wait for a valid value, leaving the destination unchanged on error
+     */
     template<typename T>
     void get(T& value) {
         const auto config = read_config();
@@ -2604,6 +2690,10 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         last_error_ = std::move(error);
     }
+
+    /**
+     * @brief Wait for a valid value with a timeout; return false on timeout/error
+     */
     template<typename T>
     bool get_timeout(T& value, std::chrono::milliseconds timeout) {
         const auto config = read_config();
@@ -2614,6 +2704,10 @@ public:
         return read;
     }
 
+    /**
+     * @brief Start an owned asynchronous read with a path/settings snapshot
+     * @return Future containing a value or an exception (AsyncCancelled on cancel)
+     */
     template<typename T>
     std::future<T> get_async() {
         auto promise = std::make_shared<std::promise<T>>();
@@ -2631,6 +2725,12 @@ public:
         });
         return future;
     }
+
+    /**
+     * @brief Read asynchronously and invoke the callback on the worker thread
+     * @note Keep external callback captures alive until completion. Pending
+     * callbacks are cancelled on reset/destruction; running callbacks are drained.
+     */
     template<typename T, typename Callback>
     void get_async(Callback callback) {
         start_async([config = read_config(), callback = std::move(callback)](const auto& state) mutable {
@@ -2640,10 +2740,18 @@ public:
                 callback(std::move(value));
         });
     }
+
+    /**
+     * @brief Force a new probe on the next try_get() call
+     */
     void invalidate_cache() {
         std::lock_guard<std::mutex> lock(mtx_);
         invalidate_cache_locked();
     }
+
+    /**
+     * @brief Cancel/drain pending operations and clear the polling/error state
+     */
     void reset() {
         stop_async();
         std::lock_guard<std::mutex> lock(mtx_);

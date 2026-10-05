@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Compatibility and regression fixes
+
+- Polling reads never sleep for retries; unchanged errors are reported once and
+  successful/failed mtime caches expire after 10 ms. Equal-timestamp rapid saves
+  are eventually reread without requiring another edit.
+- Follow configuration links for normal development reads. Opt into final-link
+  rejection with `LIVETUNER_STRICT_FILE_READS=1`; explicit writes remain strict.
+- Recheck linked targets outside the watched directory, preserving unsaved
+  nlohmann edits when disk content is unchanged.
+- Document required Quick Start files, whole-file INI/YAML rejection and atomic
+  Params binding updates; restore LiveTuner API documentation.
+
 ### Security
 
 - Own and cancel asynchronous operations, preserve watched Params across moves,
@@ -14,8 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Synchronize logging and cache invalidation; deliver diagnostics outside locks.
 - Bound configuration reads and parser resources, reject invalid numeric input,
   and preserve the last accepted Params/nlohmann snapshot on validation failure.
-- Stop creating files from read APIs; refuse final symlinks/reparse points and
-  non-regular files. Explicit nlohmann saves require an existing single-link file.
+- Stop creating files from read APIs; require regular bounded reads and offer
+  opt-in final-link rejection. Explicit nlohmann saves always require an existing
+  non-reparse, single-link regular file.
 - Escape and bound diagnostic messages; add a production runtime-disable macro.
 
 ### Validation

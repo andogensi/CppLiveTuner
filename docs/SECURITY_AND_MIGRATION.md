@@ -41,6 +41,21 @@ for a valid file, and timeout reads remain bounded. JSON must be valid JSON (no
 comments or trailing data). The nlohmann adapter retains its empty-file-as-empty-
 object behavior.
 
+`Params::update()`/`poll()` and `LiveTuner::try_get()` make at most one bounded
+read attempt per call, without retry sleeps. Matching timestamps (including
+failed probes) are cached for 10 ms, then contents are rechecked; a newly created
+file or changed mtime bypasses that cache. Unchanged consecutive errors are logged
+once, without clearing `last_error()`. `Params`' legacy retry settings remain
+stored for source compatibility but never introduce waits into polling.
+`LiveTuner` retry settings apply to blocking/asynchronous waits only.
+`NlohmannParams::update()` also probes periodically so linked targets outside the
+watched directory can change; unchanged disk content does not discard unsaved `set()` edits.
+
+The supported INI/YAML subset now rejects the whole file on a malformed data line.
+`Params::bind()` updates are all-or-nothing: any invalid bound value rejects the
+snapshot, while absent keys use their binding defaults. Neither behavior silently
+skips invalid input. See the Quick Start in README for required file setup.
+
 Explicit `NlohmannParams::save()` overwrites only an existing regular single-link
 file, after validating the opened handle. It rejects missing files, symlinks,
 reparse points and hard links; it checks write errors. Saves are not transactional

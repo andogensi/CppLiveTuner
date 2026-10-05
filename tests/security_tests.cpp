@@ -119,6 +119,64 @@ static void timestamp_regressions() {
     }
 }
 
+static void link_read_regressions() {
+    fs::create_directory("assets");
+    fs::create_directory("build");
+    write_file("assets/config.json", "{\"x\":1}");
+    write_file("assets/value.txt", "1\n");
+    fs::create_symlink("../assets/config.json", "build/linked.json");
+    fs::create_symlink("../assets/value.txt", "build/linked.txt");
+    livetuner::Params params("build/linked.json");
+    livetuner::LiveTuner tuner("build/linked.txt");
+    int named = 7, plain = 7;
+    params.bind("x", named, 7);
+#ifdef LIVETUNER_USE_NLOHMANN_JSON
+    livetuner::NlohmannParams optional("build/linked.json");
+#endif
+    if (LIVETUNER_STRICT_FILE_READS) {
+        require(!params.update() && params.has_error() && named == 7, "strict Params followed a link");
+        require(!tuner.try_get(plain) && tuner.has_error() && plain == 7, "strict LiveTuner followed a link");
+#ifdef LIVETUNER_USE_NLOHMANN_JSON
+        require(optional.get<int>("x", 7) == 7 && optional.last_error(), "strict nlohmann followed a link");
+#endif
+    } else {
+        require(params.update() && tuner.try_get(plain) && named == 1 && plain == 1, "development link reads failed");
+        params.start_watching();
+        const auto json_time = fs::last_write_time("assets/config.json");
+        const auto text_time = fs::last_write_time("assets/value.txt");
+        write_file("assets/config.json", "{\"x\":2}");
+        write_file("assets/value.txt", "2\n");
+        fs::last_write_time("assets/config.json", json_time);
+        fs::last_write_time("assets/value.txt", text_time);
+        bool observed = false;
+        const auto deadline = std::chrono::steady_clock::now() + 500ms;
+        do {
+            params.poll();
+            tuner.try_get(plain);
+            observed = named == 2 && plain == 2;
+#ifdef LIVETUNER_USE_NLOHMANN_JSON
+            optional.update();
+            observed = observed && optional.get<int>("x") == 2;
+#endif
+            if (observed) break;
+            std::this_thread::sleep_for(1ms);
+        } while (std::chrono::steady_clock::now() < deadline);
+        require(observed, "linked target outside the watched directory stayed stale");
+#ifdef LIVETUNER_USE_NLOHMANN_JSON
+        require(optional.set("x", 99), "optional unsaved edit setup failed");
+        std::this_thread::sleep_for(20ms);
+        require(!optional.update() && optional.get<int>("x") == 99, "periodic probe discarded an unsaved edit");
+#endif
+    }
+    livetuner::ErrorInfo error;
+    require(!livetuner::internal::write_regular_file("build/linked.txt", "overwrite", error), "read policy weakened linked-file writes");
+#ifdef LIVETUNER_USE_NLOHMANN_JSON
+    require(!optional.save(), "read policy weakened optional linked-file saves");
+    auto disk = livetuner::internal::read_regular_file("assets/config.json");
+    require(disk && *disk.content == (LIVETUNER_STRICT_FILE_READS ? "{\"x\":1}" : "{\"x\":2}"), "linked save changed target content");
+#endif
+}
+
 static void parser_regressions() {
     using Parser = livetuner::internal::PicojsonParser;
     Parser::ValueMap values;
@@ -199,8 +257,8 @@ static void ingress_regressions() {
 
     write_file("sentinel.txt", "do not change\n");
     fs::create_symlink(fs::absolute("sentinel.txt"), "link.txt");
-    livetuner::LiveTuner link("link.txt");
-    require(!link.try_get(value), "read followed a symlink");
+    const auto link = livetuner::internal::read_regular_file("link.txt");
+    require(LIVETUNER_STRICT_FILE_READS ? !link : (link && *link.content == "do not change\n"), "file read policy mismatch");
     fs::create_symlink(fs::absolute("not-created.txt"), "dangling.txt");
     livetuner::LiveTuner dangling("dangling.txt");
     require(!dangling.try_get(value) && !fs::exists("not-created.txt"), "dangling link target created");
@@ -403,6 +461,7 @@ int main(int argc, char** argv) {
         else if (group == "concurrency") concurrency_regressions();
         else if (group == "missing") missing_file_regressions();
         else if (group == "timestamps") timestamp_regressions();
+        else if (group == "links") link_read_regressions();
         else require(false, "unknown regression group");
         std::cout << "security regressions passed\n";
         return 0;

@@ -90,6 +90,13 @@
 #define LIVETUNER_ENABLE_RUNTIME 1
 #endif
 
+// Development reads follow configured links by default. Hardened deployments
+// can reject final symlinks/reparse points; define consistently in every TU.
+// Explicit writes always reject links, independently of this read-only policy.
+#ifndef LIVETUNER_STRICT_FILE_READS
+#define LIVETUNER_STRICT_FILE_READS 0
+#endif
+
 /**
  * @def LIVETUNER_ENABLE_DEFAULT_LOGGING
  * @brief Enable/disable default logging to stderr
@@ -1274,8 +1281,8 @@ struct FileReadResult {
     }
 };
 
-// Implemented with native handles: regular files only, no final symlink/reparse
-// point, and a bounded read even if the file grows after opening.
+// Native-handle reads always require a regular file and bound actual bytes.
+// Final links are followed unless LIVETUNER_STRICT_FILE_READS is enabled.
 FileReadResult read_regular_file(const std::filesystem::path& path);
 bool write_regular_file(const std::filesystem::path& path, const std::string& content, ErrorInfo& error);
 
@@ -2116,10 +2123,14 @@ public:
     bool poll() {
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            if (!file_changed_ || !file_changed_->exchange(false)) return false;
-            file_cache_.file_exists = false;
-            file_cache_.attempted = false;
+            if (!file_watcher_) return false;
+            if (file_changed_ && file_changed_->exchange(false)) {
+                file_cache_.file_exists = false;
+                file_cache_.attempted = false;
+            }
         }
+        // Also probe periodically: a symlink target may be in a different watched
+        // directory, and a notification may arrive before an editor finishes.
         return update();
     }
 
@@ -3124,10 +3135,7 @@ public:
     bool update() {
         // Check for changes non-blocking (timeout 0ms)
         if (!LIVETUNER_ENABLE_RUNTIME) return false;
-        if (!watcher_->wait_for_change(std::chrono::milliseconds(0))) {
-            return false;
-        }
-        return load();
+        return load(watcher_->wait_for_change(std::chrono::milliseconds(0)));
     }
 
     /**
@@ -3290,7 +3298,7 @@ private:
     /**
      * @brief Load JSON file
      */
-    bool load() {
+    bool load(bool force = true) {
         internal::DeferredCallbacks diagnostics;
         std::lock_guard<std::mutex> lock(mutex_);
         if (!LIVETUNER_ENABLE_RUNTIME) {
@@ -3298,30 +3306,41 @@ private:
             return false;
         }
         try {
+            const auto modified = internal::get_file_modify_time(file_path_);
+            const auto now = std::chrono::steady_clock::now();
+            if (!force && now - last_read_attempt_ < std::chrono::milliseconds(10) &&
+                modified == last_modify_time_) return false;
+            last_read_attempt_ = now;
+            last_modify_time_ = modified;
             ErrorInfo error;
-            auto content = internal::read_file_with_retry(file_path_, {}, &error);
-            if (!content && error.type == ErrorType::FileEmpty) {
-                json_ = json::object();
-                last_error_ = {};
-                return true;
-            }
+            auto content = internal::read_file_once(file_path_, error);
+            if (!content && error.type == ErrorType::FileEmpty) content = std::string{};
             if (!content) {
-                handle_error(error.type, error.message);
+                handle_error(error.type, error.message, true);
+                return false;
+            }
+            // Periodic checks must not discard unsaved set() changes when the
+            // actual on-disk content has not changed.
+            if (has_disk_snapshot_ && *content == last_disk_content_) {
+                last_error_ = {};
                 return false;
             }
             if (!internal::json_within_limits(*content))
                 throw std::length_error("JSON input exceeds limits");
-            json candidate = json::parse(*content);
+            json candidate = content->empty() ? json::object() : json::parse(*content);
             size_t entries = 0;
             if (!within_limits(candidate, 0, entries))
                 throw std::length_error("JSON value exceeds limits");
+            const bool changed = candidate != json_;
             json_.swap(candidate);
+            last_disk_content_ = std::move(*content);
+            has_disk_snapshot_ = true;
             last_error_ = {};
-            return true;
+            return changed;
             
         } catch (const std::exception& e) {
             handle_error(ErrorType::ParseError,
-                        "Failed to read file: " + std::string(e.what()));
+                        "Failed to read file: " + std::string(e.what()), true);
             return false;
         }
     }
@@ -3437,7 +3456,8 @@ private:
     /**
      * @brief Handle error
      */
-    void handle_error(ErrorType type, const std::string& message) const {
+    void handle_error(ErrorType type, const std::string& message, bool only_if_changed = false) const {
+        if (only_if_changed && last_error_.type == type && last_error_.message == message) return;
         last_error_ = ErrorInfo(type, message, file_path_);
         
         if (error_callback_) {
@@ -3459,6 +3479,10 @@ private:
     mutable std::mutex mutex_;
     mutable ErrorInfo last_error_;
     ErrorCallback error_callback_;
+    std::chrono::steady_clock::time_point last_read_attempt_{};
+    std::filesystem::file_time_type last_modify_time_{};
+    std::string last_disk_content_;
+    bool has_disk_snapshot_ = false;
 };
 
 /**
@@ -3738,18 +3762,20 @@ FileReadResult read_regular_file(const std::filesystem::path& path) {
 #ifdef _WIN32
     auto file = make_unique_invalid_handle(CreateFileW(path.wstring().c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        (LIVETUNER_STRICT_FILE_READS ? FILE_FLAG_OPEN_REPARSE_POINT : 0) | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
     if (file.get() == INVALID_HANDLE_VALUE)
         return failed(GetLastError() == ERROR_FILE_NOT_FOUND ? ErrorType::FileNotFound : ErrorType::FileAccessDenied,
                       "Cannot open configuration file");
     BY_HANDLE_FILE_INFORMATION info{};
     if (GetFileType(file.get()) != FILE_TYPE_DISK || !GetFileInformationByHandle(file.get(), &info) ||
-        (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
-        return failed(ErrorType::InvalidFormat, "Configuration must be a regular non-link file");
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        (LIVETUNER_STRICT_FILE_READS && (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)))
+        return failed(ErrorType::InvalidFormat, "Configuration is not a regular file permitted by the read policy");
     if (info.nFileSizeHigh != 0 || info.nFileSizeLow > max_config_bytes)
         return failed(ErrorType::InvalidFormat, "Configuration exceeds byte limit");
 #else
-    UniqueFd file(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    UniqueFd file(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK |
+        (LIVETUNER_STRICT_FILE_READS ? O_NOFOLLOW : 0)));
     if (!file) return failed(errno == ENOENT ? ErrorType::FileNotFound : ErrorType::FileAccessDenied,
                              "Cannot open configuration file");
     struct stat info{};

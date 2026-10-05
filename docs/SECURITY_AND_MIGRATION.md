@@ -6,9 +6,16 @@ authority; the library does not implement user authentication or change approval
 
 ## Deployment
 
+- For local development, configurations and their link targets are trusted project
+  files. Reading through symlinks is supported by default, including links from a
+  build directory into the source tree. The library still never creates a missing
+  configuration or writes through a link.
+- Define `LIVETUNER_STRICT_FILE_READS=1` in every translation unit only when the
+  deployment requires rejecting final symlinks/reparse points. This is opt-in;
+  ordinary local development does not require the service/operator controls below.
 - Use fixed absolute paths in a directory owned by the application administrator.
-  Protect every parent directory with OS permissions/ACLs. Final symlinks/reparse
-  points are rejected, but this is not a sandbox for attacker-writable ancestor
+  For services, protect every parent directory and any permitted link target with
+  OS permissions/ACLs. Strict reads are not a sandbox for attacker-writable ancestor
   directories, network filesystems, or a malicious filesystem driver.
 - Run with the least privileges needed. Do not expose tuning files to untrusted
   users or use the library as the authorization boundary for a privileged service.
@@ -19,6 +26,12 @@ authority; the library does not implement user authentication or change approval
 - Application-specific numeric ranges, enums, cross-field constraints, operator
   identities, approvals, audit retention and rollback generations belong to the
   host application. These controls are not provided by this patch.
+
+Windows default reads use normal reparse processing, rather than rejecting every
+reparse attribute. Actual OneDrive hydration/synchronization has not been tested;
+strict mode can reject such placeholders and explicit saves still reject reparse
+points. Filesystem/cloud I/O can block even though polling never adds retry sleeps.
+Keep latency-sensitive tuning files on a local filesystem.
 
 ## Compatibility changes
 

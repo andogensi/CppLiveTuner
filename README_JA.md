@@ -18,6 +18,9 @@
 
 </div>
 
+この更新では、設定ファイルの自動作成、不正入力の扱い、非同期処理の寿命管理が変わります。
+更新・本番導入前に[セキュリティと移行ガイド](docs_JA/SECURITY_AND_MIGRATION.md)を確認してください。
+
 ---
 
 > **STBスタイル・シングルヘッダーライブラリ**  
@@ -111,6 +114,17 @@ git submodule add https://github.com/andogensi/CppLiveTuner.git vendor/CppLiveTu
 
 ### 2️シンプルな使い方 — 単一値
 
+起動前に、**プロセスの作業ディレクトリ**へ `params.txt` を作成してください。
+ファイルは自動作成されません。別の場所を使う場合は `livetuner::tune_init(path)` を呼びます。
+初期内容の例:
+
+```text
+2.5
+```
+
+以下はアプリへの組み込み例です。例中の `running`、`player`、`physics` は
+利用アプリ側で用意するものです。
+
 ```cpp
 #define LIVETUNER_IMPLEMENTATION
 #include "LiveTuner.h"
@@ -119,19 +133,20 @@ int main() {
     float speed = 1.0f;
     
     while (running) {
-        tune_try(speed);         // ← params.txtをチェック、変更があれば更新
+        livetuner::tune_try(speed); // 1回だけ読み取り、読めなければspeedを維持
         player.move(speed);
     }
 }
 ```
 
-**実行中に `params.txt` を編集:**
-```
-2.5
-```
-→ `speed` が即座に `2.5` に！ 🎉
+実行中も `params.txt` を編集して `speed` を調整できます。欠損・空・不正なファイルでは
+直前の値を維持して `false` を返し、再試行のためのsleepはしません。同じエラーの連続ログは
+1回にまとめますが、`last_error()` にはエラー状態が残ります。
 
 ### 3️ 推奨の使い方 — 名前付きパラメータ
+
+起動前に、下記の内容で `config.json` を作成してください。欠損したまま起動した場合は、
+有効な設定が用意されるまでbind時の既定値を使います。
 
 ```cpp
 #define LIVETUNER_IMPLEMENTATION
@@ -159,7 +174,7 @@ int main() {
 }
 ```
 
-**実行中に `config.json` を編集:**
+**`config.json`（起動前に作成し、実行中も編集可能）:**
 ```json
 {
     "speed": 2.5,
@@ -168,6 +183,20 @@ int main() {
 }
 ```
 → 3つの値すべてが即座に更新！ 🚀
+
+`Params::update()` は**全bindの値を検証してから一括反映**します。1つでも型変換できない
+値があれば、全体を反映せず直前の正常な設定を維持します。欠けたキーにはbind時の既定値を
+使います。JSONの構文不正や、INI/YAMLの対応範囲内で不正なデータ行があれば、ファイル全体を
+拒否します。不正行を黙って読み飛ばす挙動ではありません。
+
+mtimeが同じでも10msのキャッシュ期限後に内容を再確認します。`tune_try()` は同じ値の
+再読み取りでも成功時に `true`、`Params::update()` は受理したパラメータの集合が変わった時に
+`true` を返します。OSのファイルI/O自体は同期処理なので、フレーム時間が重要な用途では
+低速・ネットワーク・クラウド上のファイルを避けてください。
+
+設定ファイルへのsymlinkは既定で読み取り可能です。最終要素のsymlink/reparse pointを
+拒否したい場合は、全翻訳単位で `LIVETUNER_STRICT_FILE_READS=1` を指定します。
+明示的な保存はリンク経由では行いません。
 
 ---
 
@@ -193,7 +222,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 | 関数 | 説明 |
 |------|------|
 | `tune_init(path)` | パラメータファイルを設定 (デフォルト: `params.txt`) |
-| `tune_try(value)` | **ノンブロッキング**: 変更があれば更新、更新時は`true`を返す |
+| `tune_try(value)` | **再試行sleepなし**: キャッシュ期限・メタデータ変化で1回読み取り、成功時`true` |
 | `tune(value)` | **ブロッキング**: 値が取得できるまで待機 |
 | `tune_timeout(value, dur)` | タイムアウト時は`false`を返す |
 | `tune_async<T>()` | `std::future<T>`を返す |
@@ -206,7 +235,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 |------|------|
 | `Params(path, format)` | コンストラクタ (format: Auto/Json/Yaml/KeyValue/Plain) |
 | `bind(name, var, default)` | 変数をパラメータにバインド |
-| `update()` | **ノンブロッキング**: 変更があれば全バインドを更新 |
+| `update()` | **再試行sleepなし**: 全bindを検証し、変更を一括反映 |
 | `get<T>(name)` | `std::optional<T>`として取得 |
 | `get_or<T>(name, default)` | デフォルト値付きで取得 |
 | `on_change(callback)` | 変更コールバックを設定 |
@@ -224,6 +253,10 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 | **プレーンテキスト** | `.txt` | `1.5` |
 
 > ⚠️ **YAML制限事項**: シンプルな `key: value` 形式のみ対応。**ネストされたオブジェクト、配列、高度なYAML機能は非対応。** 詳細は下記参照。
+
+INI/YAMLの空行・コメント・対応するINIセクション見出しは利用できます。
+区切り文字のない行など、不正なデータ行が1つでもあればファイル全体を拒否します。
+`Params::last_error()` で原因を確認でき、その間も直前の正常な設定が使われます。
 
 <details>
 <summary>📄 フォーマット例 (クリックで展開)</summary>

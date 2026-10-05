@@ -16,6 +16,9 @@
 
 </div>
 
+This update changes file creation, invalid-input handling and asynchronous lifetime behavior. Read the
+[security and migration guide](docs/SECURITY_AND_MIGRATION.md) before upgrading or enabling tuning in production.
+
 ---
 
 > **📋 STB-style Single Header Library**  
@@ -109,6 +112,17 @@ git submodule add https://github.com/andogensi/CppLiveTuner.git vendor/CppLiveTu
 
 ### 2️ Simple Usage — Single Value
 
+Create `params.txt` in the **process working directory** before launching (it is
+not created automatically). For another location, call `livetuner::tune_init(path)`.
+For example, start with:
+
+```text
+2.5
+```
+
+The loop below is an integration sketch: `running`, `player` and `physics` in
+these examples are supplied by your application.
+
 ```cpp
 #define LIVETUNER_IMPLEMENTATION
 #include "LiveTuner.h"
@@ -117,19 +131,20 @@ int main() {
     float speed = 1.0f;
     
     while (running) {
-        tune_try(speed);         // ← Checks params.txt, updates if changed
+        livetuner::tune_try(speed); // One read attempt; keeps speed if unavailable
         player.move(speed);
     }
 }
 ```
 
-**Edit `params.txt` while running:**
-```
-2.5
-```
-→ `speed` instantly becomes `2.5`! 🎉
+Edit `params.txt` while running to tune `speed`. A missing/empty/invalid file
+leaves the last value unchanged and returns `false`; it never adds retry sleeps.
+Identical consecutive errors are logged once, and `last_error()` remains available.
 
 ### 3️ Recommended Usage — Named Parameters
+
+Create `config.json` with the contents shown below before starting. If it is
+missing, the bound defaults remain in use until a valid configuration is supplied.
 
 ```cpp
 #define LIVETUNER_IMPLEMENTATION
@@ -157,7 +172,7 @@ int main() {
 }
 ```
 
-**Edit `config.json` while running:**
+**`config.json` (create before launch, then edit while running):**
 ```json
 {
     "speed": 2.5,
@@ -166,6 +181,21 @@ int main() {
 }
 ```
 → All three values update instantly! 🚀
+
+`Params::update()` validates **all bound values before changing any variable**.
+One invalid bound value rejects the entire update and preserves the last good
+snapshot. A missing key uses its binding default. Malformed JSON or a malformed
+non-comment line in the supported INI/YAML subset rejects the whole file; invalid
+lines are not silently skipped.
+
+Polling rechecks contents after a 10 ms cache window even when mtime is unchanged.
+`tune_try()` can return `true` on a successful periodic re-read of the same value;
+`Params::update()` returns `true` only when its accepted parameter map changes.
+Filesystem I/O is synchronous: avoid slow/network/cloud files in a frame-critical path.
+
+Reading symlinked project configurations is supported by default. Define
+`LIVETUNER_STRICT_FILE_READS=1` in every translation unit to reject final
+symlinks/reparse points. Explicit saves never write through links.
 
 ---
 
@@ -191,7 +221,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 | Function | Description |
 |----------|-------------|
 | `tune_init(path)` | Set parameter file (default: `params.txt`) |
-| `tune_try(value)` | **Non-blocking**: Update if changed, returns `true` if updated |
+| `tune_try(value)` | **No retry sleeps**: One read when cache expires/metadata changes; `true` on success |
 | `tune(value)` | **Blocking**: Wait until value is available |
 | `tune_timeout(value, dur)` | Returns `false` if timeout |
 | `tune_async<T>()` | Returns `std::future<T>` |
@@ -204,7 +234,7 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 |----------|-------------|
 | `Params(path, format)` | Constructor (format: Auto/Json/Yaml/KeyValue/Plain) |
 | `bind(name, var, default)` | Bind variable to parameter |
-| `update()` | **Non-blocking**: Update all bindings if changed |
+| `update()` | **No retry sleeps**: Validate and update all bindings together if changed |
 | `get<T>(name)` | Get as `std::optional<T>` |
 | `get_or<T>(name, default)` | Get with default value |
 | `on_change(callback)` | Set change callback |
@@ -222,6 +252,10 @@ g++ -std=c++17 your_program.cpp -I include -pthread -o program
 | **Plain Text** | `.txt` | `1.5` |
 
 > ⚠️ **YAML Limitation**: Only simple `key: value` pairs are supported. **No nested objects, arrays, or advanced YAML features.** See details below.
+
+INI/YAML blank lines, comments and supported INI section headers are allowed.
+A malformed data line (for example, a line without a separator) rejects the entire
+file. `Params::last_error()` reports the failure and the last accepted values remain active.
 
 <details>
 <summary>📄 Format Examples (click to expand)</summary>

@@ -12,7 +12,11 @@
 #include "include/LiveTuner.h"
 
 #include <iostream>
-#include <cassert>
+#include <stdexcept>
+
+static void check(bool condition) {
+    if (!condition) throw std::runtime_error("smoke test failed");
+}
 
 int main() {
     std::cout << "=== LiveTuner Compilation Test ===" << std::endl;
@@ -38,12 +42,12 @@ int main() {
     // Test 2: ErrorInfo compiles and works
     {
         livetuner::ErrorInfo err;
-        assert(err.type == livetuner::ErrorType::None);
-        assert(!err);  // No error
+        check(err.type == livetuner::ErrorType::None);
+        check(!err);  // No error
         
         livetuner::ErrorInfo err2(livetuner::ErrorType::FileNotFound, "test.txt not found", "test.txt");
-        assert(err2.type == livetuner::ErrorType::FileNotFound);
-        assert(err2);  // Has error
+        check(err2.type == livetuner::ErrorType::FileNotFound);
+        check(static_cast<bool>(err2));  // Has error
         
         std::cout << "[PASS] ErrorInfo works" << std::endl;
     }
@@ -61,8 +65,10 @@ int main() {
     
     // Test 4: Params class compiles (without actual file)
     {
-        // Just verify the class is constructible
-        // Don't actually create a Params instance without a file
+        livetuner::Params params("unused-smoke.json");
+        int value = 0;
+        params.bind("value", value, 7);
+        check(value == 7 && params.get_bound_names().size() == 1);
         
         std::cout << "[PASS] Params class available" << std::endl;
     }
